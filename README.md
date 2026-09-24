@@ -55,24 +55,7 @@ dsh plugin --profile <profile> add "git+https://github.com/2huy4n/ProjectKaren#v
 
 ## License
 
-**AGPL-3.0-or-later** —— GNU Affero General Public License v3.0 或更高版本。完整条文见 [LICENSE](./LICENSE)。
-
-说人话：你可以自由使用、修改、再发布本插件，**但基于它的衍生作品也必须以同样的许可开源**；
-而且**即使你只是把它架成在线服务给别人用（不发布二进制），也必须提供源码**。
-
-```
-ProjectKaren —— 一个让角色按「时间」行动的 DSH 插件
-Copyright (C) 2026 2huy4n
-
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU Affero General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU Affero General Public License for more details.
+**AGPL-3.0-or-later** 
 
 You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
