@@ -55,4 +55,6 @@ dsh plugin --profile <profile> add "git+https://github.com/2huy4n/ProjectKaren#v
 
 ## License
 
-**AGPL-3.0-or-later** 
+**AGPL-3.0-or-later** —— GNU Affero General Public License v3.0 或更高版本。
+
+Copyright (C) 2026 2huy4n · 完整条文见 [LICENSE](./LICENSE)
