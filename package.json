@@ -1,0 +1,50 @@
+{
+  "name": "project-karen",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "ProjectKaren: a DeepSeek Harness plugin that gives a roleplay character a clock - sleep/wake, greetings, idle actions, proactive small talk, and optional outing photos.",
+  "main": "./dsh/index.js",
+  "exports": {
+    ".": "./dsh/index.js",
+    "./client": "./client/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dsh",
+    "client",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings"
+      ],
+      "platform": "web"
+    }
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "dsh",
+    "cordis",
+    "roleplay",
+    "life-simulation"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/2huy4n/ProjectKaren.git"
+  },
+  "homepage": "https://github.com/2huy4n/ProjectKaren#readme",
+  "bugs": {
+    "url": "https://github.com/2huy4n/ProjectKaren/issues"
+  },
+  "license": "AGPL-3.0-or-later"
+}

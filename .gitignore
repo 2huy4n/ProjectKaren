@@ -1,0 +1,11 @@
+# DSH plugin repo for project-karen - no build step, source is the deliverable.
+node_modules/
+pnpm-lock.yaml
+
+# local runtime state / scratch
+*.log
+*.tmp
+*.bak
+*.bak-*
+.DS_Store
+Thumbs.db

@@ -1,0 +1,4 @@
+# project-karen bundle patch: inserts the plugin row into the web plugin roster.
+- insert:
+    - id: project-karen
+      name: 'project-karen'
