@@ -159,6 +159,9 @@ window.__ModuleLoader__.load({ id: "project-karen", factory: (require) => {
     };
     const save = () => guard(async () => {
       const payload = { ...cfg };
+      // cfg.apiKey 是服务端回的 '***xxxx' 脱敏回显，绝不能原样回传（会把真实 Key 覆盖成掩码）。
+      // 只有用户这次真的输入了新 Key 才带 apiKey 字段。
+      delete payload.apiKey;
       if (keyDraft.trim()) payload.apiKey = keyDraft.trim();
       const r = await call("/config", { config: payload });
       setCfg(r.value); setKeyDraft(""); setDirty(false); setNote("已保存");

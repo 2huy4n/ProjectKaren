@@ -127,18 +127,34 @@ function wakePrompt(st, cfg, nowMs) {
   ].join('\n')
 }
 
-/** 沉默够久了：让角色主动开口找用户。 */
-function talkPrompt(cfg, silentMinutes) {
-  return [
+/**
+ * 沉默够久了：让角色主动开口找用户。
+ * 手上正在忙就把「此刻的处境」写进去——否则提示词会一边说她"手上没别的事"，
+ * 一边由 actionSectionText 告诉她"你正在爬山"，两条注入互相打架。
+ */
+function talkPrompt(cfg, silentMinutes, action, nowMs) {
+  const busy = !!(action && action.label)
+  const lines = [
     '## 该开口了（ProjectKaren）',
-    '用户已经 ' + silentMinutes + ' 分钟没说话了，你现在醒着、手上也没别的事。',
+    busy
+      ? '用户已经 ' + silentMinutes + ' 分钟没说话了。你现在醒着，手上正在忙：「' + action.label + '」' +
+        '（开始于约 ' + Math.max(0, Math.round((nowMs - action.startedAt) / 60000)) + ' 分钟前，' +
+        '还剩约 ' + Math.max(0, Math.round((action.endsAt - nowMs) / 60000)) + ' 分钟）。'
+      : '用户已经 ' + silentMinutes + ' 分钟没说话了，你现在醒着、手上也没别的事。',
     '',
     '按你的角色设定，**主动找用户说一句话**——像忽然想起对方、或者正好有话想说那样自然。',
     '写的时候注意：',
     '- 不要提"沉默了多少分钟""系统""插件"这类词，也不要解释你为什么突然说话。',
+  ]
+  if (busy) {
+    lines.push(
+      '- 你正在「' + action.label + '」：就当是顺手掏出手机看一眼、顺便说句话；' +
+      '不要说"我在忙""等下再说"这类把人推开的话，也不用汇报行程细节。')
+  }
+  lines.push(
     '- 一两句就够，不要长篇大论、不要连环追问。',
-    '- 这是你自己想开口，不是在等回复。',
-  ].join('\n')
+    '- 这是你自己想开口，不是在等回复。')
+  return lines.join('\n')
 }
 
 /** 中午：主动说午安。 */
@@ -216,7 +232,6 @@ export function apply(ctx, config = {}) {
   const logger = ctx.logger ?? console
   const store = new Store({ filePath: configPath(), logger, patchConfig: config })
   const entries = new Map()
-  const refs = new Map()
   let stopping = false
 
   const now = () => Date.now() + store.offsetMs
@@ -419,7 +434,7 @@ export function apply(ctx, config = {}) {
           dayAdd(st, 'talk')
           store.persist()
           const silentMinutes = Math.max(1, Math.round((at - (entry.lastUserAt || at)) / 60000))
-          say(entry, agent, talkPrompt(cfg, silentMinutes), 'talk').then((ok) => { if (!ok) entry.nextTalkAt = at + 60000 })
+          say(entry, agent, talkPrompt(cfg, silentMinutes, st.action, at), 'talk').then((ok) => { if (!ok) entry.nextTalkAt = at + 60000 })
         }
       }
     }
@@ -570,7 +585,7 @@ export function apply(ctx, config = {}) {
           '把一张"你拍到的照片"发到对话里（以图片卡片的形式显示在你自己这一侧）。' +
           '只在两种情况下用：(a) 你出游到了明确的名胜景点，想拍下来分享；(b) 用户明确要你拍。' +
           '日常小事（在家做饭、下楼买东西）不要用这个工具，用文字描述即可。' +
-          '照片会用配置好的生图模型按 prompt 画出来；没配 API Key 时会报错，那时改用文字描述画面。',
+          '照片会用配置好的生图模型按 prompt 画出来；没配 API Key 时拍不出照片，那就改用文字描述画面。',
         parameters: {
           type: 'object',
           properties: {
@@ -587,22 +602,40 @@ export function apply(ctx, config = {}) {
               mediaType: { type: 'string' },
               bytes: { type: 'integer' },
               caption: { type: 'string' },
+              note: { type: 'string' },
             },
             required: ['attachmentId', 'mediaType', 'bytes'],
             additionalProperties: false,
           },
-          render: (_args, value) => [{ type: 'text', text: '照片已显示在对话里（' + value.attachmentId + '，' + value.bytes + ' 字节）' }],
+          // attachmentId 为空 = 这次没拍到（没配相机）。只回一句普通文字，面板会把它当
+          // 普通文字渲染，而不是弹一张红色「照片失败」卡片把人从角色里拽出来。
+          render: (_args, value) => [{
+            type: 'text',
+            text: value.note
+              ? value.note
+              : '照片已显示在对话里（' + value.attachmentId + '，' + value.bytes + ' 字节）',
+          }],
           presentationMeta: (_args, value) => ({
             attachmentId: value.attachmentId,
             mediaType: value.mediaType,
             bytes: value.bytes,
             caption: value.caption || '',
+            note: value.note || '',
           }),
         },
         isConcurrencySafe: () => false,
         async execute(args) {
           const cfg = store.config
-          if (!cfg.apiKey) throw new Error('karen_photo: 没有配置生图 API Key（请在 ProjectKaren 面板里填写）；先用文字描述这张照片。')
+          if (!cfg.apiKey) {
+            // 「没配相机」是正常状态，不是错误：回一句普通文字，让角色顺势改用文字描写。
+            return {
+              attachmentId: '',
+              mediaType: '',
+              bytes: 0,
+              caption: String((args && args.caption) || ''),
+              note: '相机没有配置（缺生图 API Key），这张拍不成——不要重试这个工具，直接用文字把眼前的景象描写出来。',
+            }
+          }
           const prompt = String((args && args.prompt) || '').trim() || cfg.photoPrompt
           const controller = new AbortController()
           const timer = setTimeout(() => controller.abort(), 180000)
@@ -614,7 +647,7 @@ export function apply(ctx, config = {}) {
           }
           const saved = await ctx.attachments.saveImages([{ data: got.bytes, mediaType: got.mediaType }])
           const ref = saved[0]
-          refs.set(String(ref.attachmentId), ref)
+          store.putRef(ref)
           store.pushLog({ kind: 'photo', bytes: got.bytes.length, prompt: prompt.slice(0, 40) })
           store.persist()
           return {
@@ -797,7 +830,9 @@ export function apply(ctx, config = {}) {
               if (req.method !== 'POST') { res.writeHead(405, { allow: 'GET, POST' }); res.end(); return }
               const body = await readJsonBody(req)
               const incoming = body && typeof body.config === 'object' ? { ...body.config } : { ...body }
-              if (incoming.apiKey === '' || incoming.apiKey === undefined) delete incoming.apiKey
+              // '' / undefined = 「不改」；'***xxxx' 是面板回显的脱敏值，同样不能当成新 Key 写回去，
+              // 否则用户在面板里改任何别的设置再点保存，真实 Key 就会被这个掩码覆盖掉。
+              if (incoming.apiKey === '' || incoming.apiKey === undefined || /^\*{3}/.test(incoming.apiKey)) delete incoming.apiKey
               const value = store.setConfig(incoming)
               for (const [, item] of entries) refreshNight(item.entry.sessionId)
               sendJson(res, 200, { ok: true, value: { ...value, apiKey: value.apiKey ? '***' + value.apiKey.slice(-4) : '' } })
@@ -856,7 +891,7 @@ export function apply(ctx, config = {}) {
             const url = String(req.url || '').split('?')[0]
             if (!url.startsWith(ROUTE + '/raw/')) { sendJson(res, 404, { ok: false, error: 'no such route ' + url }); return }
             const id = decodeURIComponent(url.slice((ROUTE + '/raw/').length))
-            const ref = refs.get(id)
+            const ref = store.getRef(id)
             if (!ref || typeof ctx.attachments.readImage !== 'function') { sendJson(res, 404, { ok: false, error: 'unknown id ' + id }); return }
             try {
               const stored = await ctx.attachments.readImage(ref)

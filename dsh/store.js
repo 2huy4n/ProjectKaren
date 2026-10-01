@@ -116,6 +116,9 @@ export function normalizeConfig(raw) {
   }
 }
 
+/** 保留多少张照片的引用；附件对象本身在 DSH_HOME/attachments 里，这里只存元数据。 */
+const MAX_REFS = 200
+
 export class Store {
   constructor({ filePath, logger, patchConfig } = {}) {
     this.filePath = filePath || configPath()
@@ -124,6 +127,9 @@ export class Store {
     this.config = normalizeConfig({ ...(patchConfig || {}), ...(loaded.config || {}) })
     this.state = loaded.state && typeof loaded.state === 'object' ? loaded.state : {}
     this.log = Array.isArray(loaded.log) ? loaded.log.slice(-60) : []
+    // 照片引用必须持久化：ctx.attachments.readImage(ref) 会拿 ref 去校验
+    // mediaType/bytes/width/height，重启后内存里没有它就再也读不回图片了。
+    this.refs = loaded.refs && typeof loaded.refs === 'object' && !Array.isArray(loaded.refs) ? loaded.refs : {}
   }
 
   read() {
@@ -154,11 +160,32 @@ export class Store {
     this.log = this.log.slice(-60)
   }
 
+  /** 记下一张照片的引用；只留 readImage 校验用得上的那几个字段。 */
+  putRef(ref) {
+    const id = String((ref && ref.attachmentId) || '')
+    if (!id) return ''
+    this.refs[id] = {
+      attachmentId: id,
+      mediaType: String(ref.mediaType || 'image/png'),
+      width: Number(ref.width) || 0,
+      height: Number(ref.height) || 0,
+      bytes: Number(ref.bytes) || 0,
+    }
+    const keys = Object.keys(this.refs)
+    if (keys.length > MAX_REFS) for (const key of keys.slice(0, keys.length - MAX_REFS)) delete this.refs[key]
+    return id
+  }
+
+  getRef(id) {
+    const found = this.refs[String(id || '')]
+    return found && typeof found === 'object' ? found : null
+  }
+
   persist() {
     try {
       mkdirSync(path.dirname(this.filePath), { recursive: true })
       const tmp = this.filePath + '.tmp'
-      writeFileSync(tmp, JSON.stringify({ config: this.config, state: this.state, log: this.log }, null, 2), 'utf-8')
+      writeFileSync(tmp, JSON.stringify({ config: this.config, state: this.state, log: this.log, refs: this.refs }, null, 2), 'utf-8')
       renameSync(tmp, this.filePath)
       return true
     } catch (error) {
