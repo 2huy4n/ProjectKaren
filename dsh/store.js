@@ -2,6 +2,8 @@
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'node:fs'
 import { homedir } from 'node:os'
 import path from 'node:path'
+import { normalizeBirthday } from './events.mjs'
+import { t } from './i18n.mjs'
 
 export function configPath() {
   const home = process.env.DSH_HOME || path.join(homedir(), '.dsh')
@@ -44,7 +46,16 @@ export function defaultConfig() {
     apiKey: '',
     model: 'Qwen/Qwen-Image',
     size: '1024x1024',
-    photoPrompt: '中国城市街头随手拍，写实照片，自然光',
+    photoPrompt: t('default.photoPrompt'),
+    // 城市 / 天气：两个城市可以相同（同城）也可以不同（异地）
+    citySelf: '',
+    cityUser: '',
+    weatherEnabled: true,
+    // 节日 / 生日
+    holidayEnabled: true,
+    birthdayEnabled: true,
+    birthdaySelf: '',
+    birthdayUser: '',
     offsetMinutes: 0,
   }
 }
@@ -112,6 +123,13 @@ export function normalizeConfig(raw) {
     model: textOf(merged.model, base.model),
     size: textOf(merged.size, base.size),
     photoPrompt: textOf(merged.photoPrompt, base.photoPrompt, 800),
+    citySelf: textOf(merged.citySelf, base.citySelf, 80),
+    cityUser: textOf(merged.cityUser, base.cityUser, 80),
+    weatherEnabled: merged.weatherEnabled !== false,
+    holidayEnabled: merged.holidayEnabled !== false,
+    birthdayEnabled: merged.birthdayEnabled !== false,
+    birthdaySelf: normalizeBirthday(merged.birthdaySelf),
+    birthdayUser: normalizeBirthday(merged.birthdayUser),
     offsetMinutes: intOf(merged.offsetMinutes, base.offsetMinutes, -100000, 100000),
   }
 }
@@ -130,6 +148,11 @@ export class Store {
     // 照片引用必须持久化：ctx.attachments.readImage(ref) 会拿 ref 去校验
     // mediaType/bytes/width/height，重启后内存里没有它就再也读不回图片了。
     this.refs = loaded.refs && typeof loaded.refs === 'object' && !Array.isArray(loaded.refs) ? loaded.refs : {}
+    // 天气缓存：省掉重启后的第一次请求。{ at, self, user }（self/user 是 weather.mjs 的结果）
+    this.weather = loaded.weather && typeof loaded.weather === 'object' ? loaded.weather : {}
+    // 客户端上报的 DSH 界面语言。宿主侧没有 locale 服务，只能由客户端告诉我们；
+    // 它不是用户配置项，所以放独立字段——面板保存 config 时不会把它冲掉。
+    this.locale = typeof loaded.locale === 'string' ? loaded.locale : ''
   }
 
   read() {
@@ -185,11 +208,18 @@ export class Store {
     try {
       mkdirSync(path.dirname(this.filePath), { recursive: true })
       const tmp = this.filePath + '.tmp'
-      writeFileSync(tmp, JSON.stringify({ config: this.config, state: this.state, log: this.log, refs: this.refs }, null, 2), 'utf-8')
+      writeFileSync(tmp, JSON.stringify({
+        config: this.config,
+        state: this.state,
+        log: this.log,
+        refs: this.refs,
+        weather: this.weather,
+        locale: this.locale,
+      }, null, 2), 'utf-8')
       renameSync(tmp, this.filePath)
       return true
     } catch (error) {
-      this.logger?.warn?.('project-karen: 配置写入失败 ' + String(error?.message || error))
+      this.logger?.warn?.(t('err.log.writeFailed', { msg: String(error?.message || error) }))
       return false
     }
   }
