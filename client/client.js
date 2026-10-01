@@ -117,6 +117,7 @@ window.__ModuleLoader__.load({ id: "project-karen", factory: (require) => {
     "photo.apiKeyPlaceholder": "粘贴新 Key 后点保存（不改就别填）",
     "photo.clearKey": "清空已保存的 Key",
     "photo.prompt": "默认画面提示词",
+    "photo.promptPlaceholder": "留空 = 用默认画面提示词",
 
     "sessions.title": "活跃会话 / live sessions",
     "sessions.empty": "当前没有活跃会话；打开一个对话后这里会出现。",
@@ -257,6 +258,7 @@ window.__ModuleLoader__.load({ id: "project-karen", factory: (require) => {
     "photo.apiKeyPlaceholder": "Paste a new key then save (leave blank to keep it)",
     "photo.clearKey": "Clear the stored key",
     "photo.prompt": "Default image prompt",
+    "photo.promptPlaceholder": "Leave blank to use the default prompt",
 
     "sessions.title": "Live sessions",
     "sessions.empty": "No live sessions right now; open a conversation and it will appear here.",
@@ -599,7 +601,7 @@ window.__ModuleLoader__.load({ id: "project-karen", factory: (require) => {
           value: keyDraft, onChange: (e) => { setKeyDraft(e.target.value); setDirty(true); setNote(""); } }),
         h("div", { style: st.row },
           h("button", { style: st.buttonAlt, disabled: busy, onClick: () => clearThing("apiKey") }, t("photo.clearKey")))),
-      h("label", { style: st.field }, h("span", { style: st.label }, t("photo.prompt")), text("photoPrompt")))));
+      h("label", { style: st.field }, h("span", { style: st.label }, t("photo.prompt")), text("photoPrompt", t("photo.promptPlaceholder"))))));
 
     const sessions = agents.length === 0
       ? h("p", { style: st.hint }, t("sessions.empty"))

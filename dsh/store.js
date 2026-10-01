@@ -3,7 +3,16 @@ import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'node:fs'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { normalizeBirthday } from './events.mjs'
-import { t } from './i18n.mjs'
+import { t, dicts } from './i18n.mjs'
+
+/**
+ * 历史上被"冻结"进配置的各语言默认值。
+ * photoPrompt 的默认值是一句会随语言变化的文案，旧版本把它物化后落盘了；
+ * 装载时认出这些值就等于「其实没设过」，还原成空串让它重新跟随语言。
+ */
+const KNOWN_PHOTO_DEFAULTS = new Set(
+  Object.values(dicts).map((d) => d['default.photoPrompt']).filter(Boolean),
+)
 
 export function configPath() {
   const home = process.env.DSH_HOME || path.join(homedir(), '.dsh')
@@ -46,7 +55,7 @@ export function defaultConfig() {
     apiKey: '',
     model: 'Qwen/Qwen-Image',
     size: '1024x1024',
-    photoPrompt: t('default.photoPrompt'),
+    photoPrompt: '',
     // 城市 / 天气：两个城市可以相同（同城）也可以不同（异地）
     citySelf: '',
     cityUser: '',
@@ -81,6 +90,19 @@ function clockOrBlank(value, fallback) {
   const raw = String(value == null ? '' : value).trim()
   if (!raw) return ''
   return /^\d{1,2}:\d{2}$/.test(raw) ? raw : fallback
+}
+
+/**
+ * photoPrompt 必须特殊处理：**空 = 没设过**，由运行时按当前语言取默认值。
+ * 它和其他字段不一样——其他字段的默认值是死值，怎么写都无所谓；
+ * 而它的默认值是一句话，一旦把译文写进配置就会**永久冻结那个语言**
+ * （落盘后永远非空，之后切语言也不会更新）。所以这里不做 fallback，只做"清空"。
+ */
+function photoPromptOf(value) {
+  const raw = typeof value === 'string' ? value.trim() : ''
+  if (!raw) return ''
+  if (KNOWN_PHOTO_DEFAULTS.has(raw)) return '' // 旧版本冻结进去的默认值 → 还原成"没设过"
+  return raw.slice(0, 800)
 }
 
 export function normalizeConfig(raw) {
@@ -122,7 +144,7 @@ export function normalizeConfig(raw) {
     apiKey: typeof merged.apiKey === 'string' ? merged.apiKey.trim() : base.apiKey,
     model: textOf(merged.model, base.model),
     size: textOf(merged.size, base.size),
-    photoPrompt: textOf(merged.photoPrompt, base.photoPrompt, 800),
+    photoPrompt: photoPromptOf(merged.photoPrompt),
     citySelf: textOf(merged.citySelf, base.citySelf, 80),
     cityUser: textOf(merged.cityUser, base.cityUser, 80),
     weatherEnabled: merged.weatherEnabled !== false,

@@ -689,7 +689,9 @@ export function apply(ctx, config = {}) {
               note: t('tool.photo.nokey'),
             }
           }
-          const prompt = String((args && args.prompt) || '').trim() || cfg.photoPrompt
+          // cfg.photoPrompt 为空 = 用户没设过，用当前语言的默认值
+          // （默认值不能落盘：一旦把译文写进配置就会永久冻结那个语言）
+          const prompt = String((args && args.prompt) || '').trim() || cfg.photoPrompt || t('default.photoPrompt')
           const controller = new AbortController()
           const timer = setTimeout(() => controller.abort(), 180000)
           let got
