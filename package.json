@@ -1,12 +1,12 @@
 {
   "name": "project-karen",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "type": "module",
   "description": "ProjectKaren: a DeepSeek Harness plugin that gives a roleplay character a clock - sleep/wake, greetings, idle actions, proactive small talk, and optional outing photos.",
   "main": "./dsh/index.js",
   "scripts": {
-    "test": "node test/i18n.test.mjs && node test/config-defaults.test.mjs"
+    "test": "node test/i18n.test.mjs && node test/config-defaults.test.mjs && node test/plugin-smoke.test.mjs && node test/tick-behaviour.test.mjs && node test/client-contract.test.mjs"
   },
   "exports": {
     ".": "./dsh/index.js",

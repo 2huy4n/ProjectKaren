@@ -67,4 +67,29 @@ export function t(key, vars, lang) {
   return out
 }
 
+/**
+ * 某个 key 的某个值，是不是「某一种语言的默认文案」。
+ *
+ * 用途：photoPrompt 的默认值是一句话。旧版本把它求值后写进配置并落盘，于是那个
+ * 语言被永久冻结（之后再切语言也不会更新）。装载配置时要认出这类被冻结的默认值，
+ * 把它还原成「没设过」。
+ *
+ * 把「哪些字符串算默认值」留在词典这一侧：调用方只需要问一个是非题，不必知道
+ * 词典的结构，以后加语言也只需要动这个文件。
+ */
+const DEFAULT_TEXTS = new Map()
+for (const dict of Object.values(dicts)) {
+  for (const [key, value] of Object.entries(dict)) {
+    if (typeof value !== 'string') continue
+    const seen = DEFAULT_TEXTS.get(key)
+    if (seen) seen.add(value)
+    else DEFAULT_TEXTS.set(key, new Set([value]))
+  }
+}
+
+export function isDefaultText(key, value) {
+  const seen = DEFAULT_TEXTS.get(String(key))
+  return !!seen && seen.has(String(value == null ? '' : value))
+}
+
 export { zh, en, dicts }

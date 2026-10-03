@@ -10,12 +10,13 @@
 // 角色卡/世界观不由本插件提供：假设会话里已经有角色；没写世界观时默认现实世界的中国。
 
 import { randomUUID } from 'node:crypto'
-import { Store, configPath, defaultConfig } from './store.js'
-import { ensureNight, phaseOf, formatClock, hashUnit, dayKeyOf, noonAtMs, inQuiet } from './sleep.js'
+import { Store, configPath, defaultConfig, isMaskedApiKey, maskApiKey } from './store.js'
+import { formatClock, inQuiet } from './sleep.js'
 import { t, setLang, getLang } from './i18n.mjs'
 import { weatherKey, isWet, fetchWeather } from './weather.mjs'
 import { holidaysOn, birthdayKind, lunarYearCovered, LUNAR_MIN_YEAR, LUNAR_MAX_YEAR } from './events.mjs'
 import { parseMuteInput } from './mute.mjs'
+import { SessionTimeline } from './session.mjs'
 
 export const name = 'project-karen'
 export const inject = ['agents', 'tools', 'attachments']
@@ -165,6 +166,13 @@ async function generateImage(cfg, prompt, signal) {
 export function apply(ctx, config = {}) {
   const logger = ctx.logger ?? console
   const store = new Store({ filePath: configPath(), logger, patchConfig: config })
+  // 每个会话的状态只有一个家：SessionTimeline 按 sessionId 持有它。
+  // entries 退化成「活着的 agent 注册表」，只记 cleanup，不再存状态。
+  const timeline = new SessionTimeline({
+    state: store.state,
+    persist: () => store.persist(),
+    log: (entry) => store.pushLog(entry),
+  })
   const entries = new Map()
   let stopping = false
 
@@ -176,7 +184,9 @@ export function apply(ctx, config = {}) {
   if (store.locale) setLang(store.locale)
 
   // ── 天气（Open-Meteo，免 key）：两个城市，同城/异地两套提示词 ──
-  const WEATHER_TTL_MS = 30 * 60 * 1000
+  // README 承诺「天气每小时最多刷新一次」，提醒带伞这个用途也没必要更勤。
+  // 之前是 30 分钟，等于白刷一倍次数的 Open-Meteo。
+  const WEATHER_TTL_MS = 60 * 60 * 1000
   let weatherBusy = false
 
   const refreshWeather = async (force) => {
@@ -257,9 +267,6 @@ export function apply(ctx, config = {}) {
     return t('prompt.context.head') + '\n' + lines.join('\n')
   }
 
-  /** 会话是否处于 /mute 静默期。 */
-  const mutedAt = (st, at) => at < (Number(st && st.mutedUntilMs) || 0)
-
   const titleOf = (agent) => {
     try {
       const service = typeof ctx.get === 'function' ? ctx.get('sessionTitle') : undefined
@@ -270,45 +277,19 @@ export function apply(ctx, config = {}) {
     return ''
   }
 
-  const refreshNight = (sessionId) => {
-    const st = store.sessionState(sessionId)
-    const before = st.wakeAtMs
-    ensureNight(st, { nowMs: now(), sessionId, cfg: store.config })
-    if (before !== st.wakeAtMs) store.persist()
-    return st
-  }
-
-  const rollActionDelay = (sessionId, count, cfg) => {
-    const jitter = cfg.actionJitterMinutes
-    const unit = hashUnit(sessionId + '|action|' + count)
-    const minutes = cfg.actionIntervalMinutes + (jitter ? Math.round((unit * 2 - 1) * jitter) : 0)
-    return Math.max(1, minutes) * 60000
-  }
-
-  const rollTalkDelay = (sessionId, count, cfg) => {
-    const jitter = cfg.talkJitterMinutes
-    const unit = hashUnit(sessionId + '|talk|' + count)
-    const minutes = cfg.talkIntervalMinutes + (jitter ? Math.round((unit * 2 - 1) * jitter) : 0)
-    return Math.max(1, minutes) * 60000
-  }
-
-  /** 今天某类动作已经做了几次（跨天自动归零）。 */
-  const dayUsed = (st, prefix) => (st[prefix + 'Day'] === dayKeyOf(now()) ? st[prefix + 'Count'] || 0 : 0)
-
-  const dayAdd = (st, prefix) => {
-    const today = dayKeyOf(now())
-    if (st[prefix + 'Day'] !== today) { st[prefix + 'Day'] = today; st[prefix + 'Count'] = 0 }
-    st[prefix + 'Count'] = (st[prefix + 'Count'] || 0) + 1
-    return st[prefix + 'Count']
-  }
-
   /** 在智能体的空闲窗口里投递：正在跑回合时不打断，交给下一次 tick 重试。 */
   const deliver = (agent, text) => {
     const message = {
       id: randomUUID(),
       role: 'user',
       content: [{ type: 'text', text }],
-      source: { kind: 'plugin', plugin: name },
+      // 会话格式 V4 要求 source.kind 是「生产者自己拥有的」kind，并明确拒绝退化的
+      // 'plugin'（见 @deepseek-ai/dsh-session-format-v3-to-v4 里的 source() 准入）。
+      // 旧写法 { kind: 'plugin', plugin } 会被判为
+      // "format v4 message requires a producer-owned source kind"，整轮失败。
+      // V3 宿主不校验 inbox（roleplaytimer 的注释记了这一点），所以这个形状在两端
+      // 都成立 —— 不需要再按版本分支。
+      source: { kind: 'plugin:' + name },
     }
     const send = () => { agent.followup(message); return true }
     if (agent && typeof agent.runMaintenance === 'function') {
@@ -320,185 +301,73 @@ export function apply(ctx, config = {}) {
     try { return Promise.resolve(send()) } catch { return Promise.resolve(false) }
   }
 
-  const stir = (entry, reason) => {
-    const st = refreshNight(entry.sessionId)
-    const at = now()
-    st.awakeUntilMs = at + store.config.barrageAwakeMinutes * 60000
-    st.stirredAtMs = at
-    st.stirCount = (st.stirCount || 0) + 1
-    entry.recent = []
-    store.pushLog({ kind: 'stir', sessionId: entry.sessionId, reason: reason || 'barrage', count: st.stirCount })
-    store.persist()
-    logger.info?.(t('log.stir', { session: entry.sessionId, reason: reason || 'barrage' }))
-  }
-
-  const noteUserMessage = (entry, at) => {
-    const cfg = store.config
-    if (!cfg.enabled) return
-    entry.lastUserAt = at
-    if (cfg.talkEnabled) entry.nextTalkAt = at + rollTalkDelay(entry.sessionId, entry.talkCount || 0, cfg)
-    const windowMs = cfg.barrageWindowMinutes * 60000
-    entry.recent = entry.recent.filter((t) => at - t <= windowMs)
-    entry.recent.push(at)
-    const st = refreshNight(entry.sessionId)
-    if (st.skipped) return
-    if (phaseOf(st, now()) !== 'asleep') return
-    if (entry.recent.length < cfg.barrageCount) return
-    stir(entry, 'barrage')
-  }
-
   /** 往会话里插一条插件消息（让角色说点什么）；返回是否真的投递出去了。 */
-  const say = (entry, agent, text, kind) => {
+  const say = (sessionId, agent, text, kind) => {
     // 静默期内所有主动输出直接吞掉。有意返回 true：不要在解除静默后补发一条已经过期的话。
-    if (mutedAt(store.sessionState(entry.sessionId), now())) {
-      store.pushLog({ kind: kind + '-muted', sessionId: entry.sessionId })
+    if (timeline.isMuted(sessionId, now())) {
+      store.pushLog({ kind: kind + '-muted', sessionId })
       return Promise.resolve(true)
     }
     return deliver(agent, text).then((ok) => {
       if (ok) {
-        store.pushLog({ kind, sessionId: entry.sessionId })
-        logger.info?.('project-karen: ' + kind + ' ' + entry.sessionId)
+        store.pushLog({ kind, sessionId })
+        logger.info?.('project-karen: ' + kind + ' ' + sessionId)
       } else {
-        store.pushLog({ kind: kind + '-held', sessionId: entry.sessionId })
+        store.pushLog({ kind: kind + '-held', sessionId })
       }
       return ok
     })
   }
 
-  const fireAction = (entry, agent) => {
-    const at = now()
-    const st = store.sessionState(entry.sessionId)
-    if (mutedAt(st, at)) return Promise.resolve(false)
-    entry.actionCount = (entry.actionCount || 0) + 1
-    entry.lastActionAt = at
-    entry.nextActionAt = at + rollActionDelay(entry.sessionId, entry.actionCount, store.config)
-    dayAdd(st, 'action')
-    store.persist()
-    return say(entry, agent, actionPrompt(), 'action').then((ok) => {
-      if (!ok) entry.nextActionAt = at + 60000
+  /** 把「她去做一件事」投递出去。状态迁移已经在模块里做完了。 */
+  const deliverAction = (sessionId, agent, at) => {
+    return say(sessionId, agent, actionPrompt(), 'action').then((ok) => {
+      if (!ok) timeline.retryAction(sessionId, at)
       return ok
     })
   }
 
-  /** 结束当前动作：清状态 + （非静默、非静默期时）注入收尾提示。 */
-  const finishAction = (entry, agent, opts) => {
-    const st = store.sessionState(entry.sessionId)
-    if (!st.action) return false
-    const finished = st.action
-    st.action = null
-    store.persist()
-    if ((opts && opts.silent) || mutedAt(st, now())) {
-      store.pushLog({ kind: 'action-dropped', sessionId: entry.sessionId, label: finished.label })
-      return true
+  /** 动作到点：注入收尾提示（睡着或静默期就丢掉，不补发）。 */
+  const deliverActionDone = (sessionId, agent, intent) => {
+    const finished = intent.action
+    if (intent.silent || timeline.isMuted(sessionId, now())) {
+      store.pushLog({ kind: 'action-dropped', sessionId, label: finished.label })
+      return Promise.resolve(true)
     }
     return deliver(agent, actionDonePrompt(finished)).then((ok) => {
-      store.pushLog({ kind: ok ? 'action-done' : 'action-done-held', sessionId: entry.sessionId, label: finished.label })
-      if (ok) logger.info?.(t('log.actionDone', { session: entry.sessionId, label: finished.label }))
+      store.pushLog({ kind: ok ? 'action-done' : 'action-done-held', sessionId, label: finished.label })
+      if (ok) logger.info?.(t('log.actionDone', { session: sessionId, label: finished.label }))
       return true
     })
   }
 
-  const tick = (entry, agent) => {
+  /** 把问候意图渲染成文案。文案归这里，模块只给原始值。 */
+  const greetText = (intent) => {
+    if (intent.kind === 'greet-wake') return wakePrompt(intent.vars, intent.vars.at)
+    if (intent.kind === 'greet-noon') return noonPrompt(intent.vars.at)
+    return nightPrompt(intent.vars, intent.vars.at)
+  }
+
+  /**
+   * 一次 tick 只做两件事：问模块要意图，然后照着投递。
+   * 所有状态迁移与调度判断都在 SessionTimeline.due() 里。
+   */
+  const tick = (sessionId, agent) => {
     const cfg = store.config
     if (!cfg.enabled) return
-    // 摇夜之前先记下"上一夜是几点醒的"：ensureNight 一旦重摇，wakeAtMs 会直接推到第二天
-    const prior = store.sessionState(entry.sessionId)
-    const wakeAtBefore = Number.isFinite(prior.wakeAtMs) ? prior.wakeAtMs : NaN
-    const st = refreshNight(entry.sessionId)
     const at = now()
-    const phase = phaseOf(st, at)
-    const muted = mutedAt(st, at)
-    if (entry.phase !== phase) {
-      entry.phase = phase
-      store.pushLog({ kind: phase === 'asleep' ? 'sleep' : 'wake', sessionId: entry.sessionId })
-      store.persist()
-    }
-    // 记下刚过去的那个醒来时刻（重摇后 st.wakeAtMs 已经不是它了）
-    if (Number.isFinite(wakeAtBefore) && wakeAtBefore <= at && wakeAtBefore !== st.wakeAtMs) {
-      st.lastWakeAtMs = wakeAtBefore
-      store.persist()
-    }
-    const today = dayKeyOf(at)
-    if (cfg.greetEnabled && !st.skipped && phase === 'awake' && !muted) {
-      // 睡醒：只在醒来后一小段时间内打招呼，每天一次（配置重摇/离线导致的翻转不算睡醒）
-      const lateMs = at - Number(st.lastWakeAtMs)
-      if (Number.isFinite(st.lastWakeAtMs) && lateMs >= 0 && lateMs <= cfg.greetWindowMinutes * 60000 && st.greetWakeDay !== today) {
-        st.greetWakeDay = today
-        store.persist()
-        say(entry, agent, wakePrompt(st, at), 'greet-wake').then((ok) => { if (!ok) { delete st.greetWakeDay; store.persist() } })
+    const plan = timeline.due(sessionId, cfg, at)
+    for (const intent of plan.intents) {
+      if (intent.kind === 'action') { deliverAction(sessionId, agent, at); continue }
+      if (intent.kind === 'action-done') { deliverActionDone(sessionId, agent, intent); continue }
+      if (intent.kind === 'talk') {
+        say(sessionId, agent, talkPrompt(intent.silentMinutes, intent.action, intent.at), 'talk')
+          .then((ok) => { if (!ok) timeline.retryTalk(sessionId, intent.at) })
+        continue
       }
-      // 中午：道午安，每天一次；刚睡醒那会儿让早安先说
-      if (cfg.greetNoonEnabled) {
-        const noonAt = noonAtMs({ nowMs: at, sessionId: entry.sessionId, cfg })
-        const noonLateMs = at - noonAt
-        const wokeLongAgo = !Number.isFinite(st.lastWakeAtMs) || at - st.lastWakeAtMs > 30 * 60000
-        if (noonLateMs >= 0 && noonLateMs <= cfg.greetWindowMinutes * 60000 && wokeLongAgo && st.greetNoonDay !== today) {
-          st.greetNoonDay = today
-          store.persist()
-          say(entry, agent, noonPrompt(at), 'greet-noon').then((ok) => { if (!ok) { delete st.greetNoonDay; store.persist() } })
-        }
-      }
+      say(sessionId, agent, greetText(intent), intent.kind)
+        .then((ok) => { if (!ok) timeline.undoGreet(sessionId, intent.kind) })
     }
-    // 睡前提前 N 分钟：道晚安（此时还醒着，能正常说话；每天一次）
-    if (cfg.greetEnabled && !st.skipped && phase === 'awake' && !muted) {
-      const leadMs = cfg.nightLeadMinutes * 60000
-      if (Number.isFinite(st.sleepAtMs) && at >= st.sleepAtMs - leadMs && st.greetNightFor !== st.sleepAtMs && st.greetNightDay !== today) {
-        st.greetNightFor = st.sleepAtMs
-        st.greetNightDay = today
-        store.persist()
-        say(entry, agent, nightPrompt(st, at), 'greet-night').then((ok) => { if (!ok) { st.greetNightFor = 0; delete st.greetNightDay; store.persist() } })
-      }
-    }
-    if (st.action && at >= st.action.endsAt) finishAction(entry, agent, { silent: phase !== 'awake' })
-
-    // ── 主动搭话：沉默够久就让她先开口（每天有上限，静默时段不打扰）──
-    if (cfg.talkEnabled && !st.skipped) {
-      if (!Number.isFinite(entry.nextTalkAt)) entry.nextTalkAt = (entry.lastUserAt || at) + rollTalkDelay(entry.sessionId, entry.talkCount || 0, cfg)
-      if (muted || phase !== 'awake' || inQuiet(at, cfg.talkQuietStart, cfg.talkQuietEnd)) {
-        // 睡着、静默期或正处静默时段：把倒计时往后推，等能打扰了再说
-        if (at >= entry.nextTalkAt) entry.nextTalkAt = at + 15 * 60000
-      } else if (at >= entry.nextTalkAt) {
-        if (cfg.talkDailyMax > 0 && dayUsed(st, 'talk') >= cfg.talkDailyMax) {
-          entry.nextTalkAt = at + 30 * 60000
-        } else {
-          entry.talkCount = (entry.talkCount || 0) + 1
-          entry.nextTalkAt = at + rollTalkDelay(entry.sessionId, entry.talkCount, cfg)
-          dayAdd(st, 'talk')
-          store.persist()
-          const silentMinutes = Math.max(1, Math.round((at - (entry.lastUserAt || at)) / 60000))
-          say(entry, agent, talkPrompt(silentMinutes, st.action, at), 'talk').then((ok) => { if (!ok) entry.nextTalkAt = at + 60000 })
-        }
-      }
-    }
-
-    if (st.skipped || !cfg.actionEnabled) return
-    if (muted) {
-      // 静默期：不开始新动作，也不消耗每日额度
-      entry.nextActionAt = at + 5 * 60000
-      return
-    }
-    if (phase !== 'awake') {
-      entry.nextActionAt = at + rollActionDelay(entry.sessionId, entry.actionCount || 0, cfg)
-      return
-    }
-    if (!Number.isFinite(entry.nextActionAt)) entry.nextActionAt = at + rollActionDelay(entry.sessionId, 0, cfg)
-    if (st.action) {
-      // 人还在做那件事，别催他做下一件
-      entry.nextActionAt = Math.max(at + 60000, st.action.endsAt + 60000)
-      return
-    }
-    if (at < entry.nextActionAt) return
-    const idleMs = cfg.actionIdleMinutes * 60000
-    if (at - (entry.lastUserAt || 0) < idleMs) {
-      entry.nextActionAt = at + idleMs
-      return
-    }
-    if (cfg.actionDailyMax > 0 && dayUsed(st, 'action') >= cfg.actionDailyMax) {
-      // 今天的自由动作额度用完了
-      entry.nextActionAt = at + 30 * 60000
-      return
-    }
-    fireAction(entry, agent)
   }
 
   const attach = (agent) => {
@@ -510,11 +379,12 @@ export function apply(ctx, config = {}) {
     const sessionId = sessionIdOf(agent)
     if (!sessionId) return
     try {
-      const isNewSession = !Object.prototype.hasOwnProperty.call(store.state, sessionId)
-      const entry = { sessionId, recent: [], phase: '', timer: null, lastUserAt: 0, actionCount: 0, nextActionAt: NaN, lastActionAt: 0, nextTalkAt: NaN, talkCount: 0 }
+      const isNewSession = !timeline.has(sessionId)
+      // timer 属于「这一次挂载」，不属于会话状态，所以留在 agent 注册表里。
+      let timer = null
       if (isNewSession && store.config.defaultMuted) {
         // 唤醒/搭话会往用户的历史里写东西，所以新会话默认静音，要手动「恢复生效」
-        store.sessionState(sessionId).skipped = true
+        timeline.setSkipped(sessionId, true)
         store.persist()
         logger.info?.(t('log.newSessionMuted', { session: sessionId }))
       }
@@ -525,11 +395,11 @@ export function apply(ctx, config = {}) {
               order: 60,
               text: () => {
                 try {
-                  if (!store.config.enabled) return ''
-                  const st = store.sessionState(sessionId)
-                  if (st.skipped) return ''
-                  ensureNight(st, { nowMs: now(), sessionId, cfg: store.config })
-                  return phaseOf(st, now()) === 'asleep' ? sleepPrompt(st, store.config, now()) : ''
+                  const cfg = store.config
+                  if (!cfg.enabled) return ''
+                  const view = timeline.snapshot(sessionId, cfg, now())
+                  if (!view || view.skipped) return ''
+                  return view.phase === 'asleep' ? sleepPrompt(view, cfg, now()) : ''
                 } catch { return '' }
               },
             })
@@ -540,12 +410,12 @@ export function apply(ctx, config = {}) {
               order: 61,
               text: () => {
                 try {
-                  if (!store.config.enabled) return ''
-                  const live = store.sessionState(sessionId)
-                  if (live.skipped) return ''
-                  ensureNight(live, { nowMs: now(), sessionId, cfg: store.config })
-                  if (phaseOf(live, now()) !== 'awake') return ''
-                  return actionSectionText(live, now())
+                  const cfg = store.config
+                  if (!cfg.enabled) return ''
+                  const view = timeline.snapshot(sessionId, cfg, now())
+                  if (!view || view.skipped) return ''
+                  if (view.phase !== 'awake') return ''
+                  return actionSectionText(view, now())
                 } catch { return '' }
               },
             })
@@ -559,7 +429,7 @@ export function apply(ctx, config = {}) {
                 try {
                   const cfg = store.config
                   if (!cfg.enabled) return ''
-                  if (store.sessionState(sessionId).skipped) return ''
+                  if (timeline.isSkipped(sessionId)) return ''
                   return contextSectionText(cfg, now())
                 } catch { return '' }
               },
@@ -573,7 +443,7 @@ export function apply(ctx, config = {}) {
                 try {
                   const cfg = store.config
                   if (!cfg.enabled || cfg.apiKey) return ''
-                  if (store.sessionState(sessionId).skipped) return ''
+                  if (timeline.isSkipped(sessionId)) return ''
                   return cameraPrompt()
                 } catch { return '' }
               },
@@ -585,13 +455,19 @@ export function apply(ctx, config = {}) {
                 if (!session || String(session.id) !== sessionId) return
                 if (!event || event.type !== 'user/message') return
                 if (!event.data || !event.data.source || event.data.source.kind !== 'user') return
-                noteUserMessage(entry, Date.now())
+                const stirred = timeline.noteUserMessage(sessionId, store.config, Date.now())
+                if (stirred) {
+                  // 注意：这里的 reason 必须是变量。i18n 测试的扫描器会把 t(...) 参数里
+                  // 出现的字符串字面量当成候选键，硬编码 'barrage' 会被误报成缺键。
+                  const reason = 'barrage'
+                  logger.info?.(t('log.stir', { session: sessionId, reason }))
+                }
               } catch { /* 单条事件出错不影响其它 */ }
             })
           : () => {}
-        entry.timer = setInterval(() => tick(entry, agent), TICK_MS)
+        timer = setInterval(() => tick(sessionId, agent), TICK_MS)
         return () => {
-          try { clearInterval(entry.timer) } catch {}
+          try { clearInterval(timer) } catch {}
           try { offEvent() } catch {}
           try { section() } catch {}
           try { actionSection() } catch {}
@@ -599,8 +475,8 @@ export function apply(ctx, config = {}) {
           try { cameraSection() } catch {}
         }
       }, 'project-karen.runtime()')
-      entries.set(agent, { entry, cleanup })
-      refreshNight(sessionId)
+      entries.set(agent, { sessionId, cleanup })
+      timeline.snapshot(sessionId, store.config, now())
     } catch (error) {
       logger.warn?.(t('err.attach.failed', { msg: String(error?.message || error) }))
     }
@@ -753,19 +629,15 @@ export function apply(ctx, config = {}) {
           const raw = Number.isFinite(asked) ? asked : cfg.actionDefaultMinutes
           const minutes = Math.min(cfg.actionMaxMinutes, Math.max(cfg.actionMinMinutes, raw))
           const at = now()
-          const st = store.sessionState(sessionId)
-          st.action = {
+          const started = timeline.startAction(sessionId, {
             label,
             motive: String((args && args.motive) || '').trim(),
             minutes,
-            startedAt: at,
-            endsAt: at + minutes * 60000,
-          }
-          st.actionCount = (st.actionCount || 0) + 1
+          }, at)
           store.pushLog({ kind: 'action-start', sessionId, label })
           store.persist()
           logger.info?.(t('log.actionStart', { session: sessionId, label }))
-          return { label, minutes, endsAt: st.action.endsAt }
+          return { label, minutes, endsAt: started.endsAt }
         },
       })
       logger.info?.(t('log.toolRegistered', { tool: 'karen_action' }))
@@ -787,23 +659,22 @@ export function apply(ctx, config = {}) {
           handler: (invocation) => {
             const sessionId = sessionIdOf(invocation && invocation.agent)
             if (!sessionId) return { kind: 'error', text: t('cmd.mute.usage') }
-            const st = store.sessionState(sessionId)
-            if (st.skipped) return { kind: 'error', text: t('cmd.mute.muted') }
+            if (timeline.isSkipped(sessionId)) return { kind: 'error', text: t('cmd.mute.muted') }
             const parsed = parseMuteInput(invocation && invocation.rawInput, now())
             if (parsed.kind === 'error') {
               if (parsed.reason === 'empty') return { kind: 'error', text: t('cmd.mute.usage') }
               if (parsed.reason === 'range') return { kind: 'error', text: t('cmd.mute.badRange') }
               return { kind: 'error', text: t('cmd.mute.badTime', { input: parsed.input }) }
             }
-            const wasMuted = mutedAt(st, now())
+            const wasMuted = timeline.isMuted(sessionId, now())
             if (parsed.kind === 'off') {
-              st.mutedUntilMs = 0
+              timeline.setMute(sessionId, 0)
               store.pushLog({ kind: 'unmute', sessionId })
               store.persist()
               if (wasMuted) logger.info?.(t('log.unmute', { session: sessionId }))
               return { kind: 'success', text: t('cmd.mute.off') }
             }
-            st.mutedUntilMs = parsed.atMs
+            timeline.setMute(sessionId, parsed.atMs)
             store.pushLog({ kind: 'mute', sessionId, until: parsed.atMs })
             store.persist()
             const until = hhmm(new Date(parsed.atMs))
@@ -820,44 +691,50 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  const describe = (agent, entry) => {
-    const st = store.sessionState(entry.sessionId)
-    const at = now()
+  /**
+   * 把模块的状态快照翻译成面板吃的线上形状。
+   * 字段改名、null 归一化、以及「actionCount 优先取每日计数」这些约定都住在这里，
+   * 所以状态那边改名字不会漏到客户端。
+   */
+  const describe = (agent, sessionId) => {
     const cfg = store.config
-    const nextActionAt = Number.isFinite(entry.nextActionAt) ? entry.nextActionAt : null
+    const at = now()
+    const view = timeline.snapshot(sessionId, cfg, at)
+    if (!view) return null
+    const nextActionAt = Number.isFinite(view.nextActionAt) ? view.nextActionAt : null
     return {
-      sessionId: entry.sessionId,
+      sessionId,
       title: titleOf(agent),
-      skipped: !!st.skipped,
-      mutedUntil: Number(st.mutedUntilMs) || 0,
-      muted: at < (Number(st.mutedUntilMs) || 0),
-      phase: phaseOf(st, at),
-      sleepAt: Number.isFinite(st.sleepAtMs) ? st.sleepAtMs : null,
-      wakeAt: Number.isFinite(st.wakeAtMs) ? st.wakeAtMs : null,
-      sleepLocal: Number.isFinite(st.sleptMinutes) ? formatClock(st.sleptMinutes) : null,
-      wakeLocal: Number.isFinite(st.wokeMinutes) ? formatClock(st.wokeMinutes) : null,
-      minutesToSleep: Number.isFinite(st.sleepAtMs) ? Math.max(0, Math.round((st.sleepAtMs - at) / 60000)) : null,
-      minutesToWake: Number.isFinite(st.wakeAtMs) ? Math.max(0, Math.round((st.wakeAtMs - at) / 60000)) : null,
-      awakeUntil: Number.isFinite(st.awakeUntilMs) ? st.awakeUntilMs : null,
-      stirCount: st.stirCount || 0,
-      lastStirAt: Number.isFinite(st.stirredAtMs) ? st.stirredAtMs : null,
-      actionCount: st.actionCount || entry.actionCount || 0,
-      actionLabel: st.action ? st.action.label : "",
-      actionMotive: st.action ? st.action.motive || "" : "",
-      actionEndsAt: st.action ? st.action.endsAt : null,
-      minutesToActionEnd: st.action ? Math.max(0, Math.round((st.action.endsAt - at) / 60000)) : null,
-      lastActionAt: entry.lastActionAt || null,
+      skipped: view.skipped,
+      mutedUntil: view.mutedUntil,
+      muted: view.muted,
+      phase: view.phase,
+      sleepAt: view.sleepAtMs,
+      wakeAt: view.wakeAtMs,
+      sleepLocal: Number.isFinite(view.sleptMinutes) ? formatClock(view.sleptMinutes) : null,
+      wakeLocal: Number.isFinite(view.wokeMinutes) ? formatClock(view.wokeMinutes) : null,
+      minutesToSleep: Number.isFinite(view.sleepAtMs) ? Math.max(0, Math.round((view.sleepAtMs - at) / 60000)) : null,
+      minutesToWake: Number.isFinite(view.wakeAtMs) ? Math.max(0, Math.round((view.wakeAtMs - at) / 60000)) : null,
+      awakeUntil: view.awakeUntilMs,
+      stirCount: view.stirCount,
+      lastStirAt: view.stirredAtMs,
+      actionCount: view.actionDayCount || view.actionRollCount || 0,
+      actionLabel: view.action ? view.action.label : "",
+      actionMotive: view.action ? view.action.motive || "" : "",
+      actionEndsAt: view.action ? view.action.endsAt : null,
+      minutesToActionEnd: view.action ? Math.max(0, Math.round((view.action.endsAt - at) / 60000)) : null,
+      lastActionAt: view.lastActionAt || null,
       nextActionAt,
       minutesToAction: nextActionAt ? Math.max(0, Math.round((nextActionAt - at) / 60000)) : null,
-      actionReady: !!(cfg.actionEnabled && !st.skipped && phaseOf(st, at) === 'awake' && nextActionAt && at >= nextActionAt),
-      actionToday: dayUsed(st, 'action'),
+      actionReady: !!(cfg.actionEnabled && !view.skipped && view.phase === 'awake' && nextActionAt && at >= nextActionAt),
+      actionToday: view.actionsToday,
       talkEnabled: !!cfg.talkEnabled,
-      talkCount: entry.talkCount || 0,
-      talkToday: dayUsed(st, 'talk'),
-      nextTalkAt: Number.isFinite(entry.nextTalkAt) ? entry.nextTalkAt : null,
-      minutesToTalk: Number.isFinite(entry.nextTalkAt) ? Math.max(0, Math.round((entry.nextTalkAt - at) / 60000)) : null,
+      talkCount: view.talkRollCount || 0,
+      talkToday: view.talksToday,
+      nextTalkAt: Number.isFinite(view.nextTalkAt) ? view.nextTalkAt : null,
+      minutesToTalk: Number.isFinite(view.nextTalkAt) ? Math.max(0, Math.round((view.nextTalkAt - at) / 60000)) : null,
       quietNow: inQuiet(at, cfg.talkQuietStart, cfg.talkQuietEnd),
-      lastUserAt: entry.lastUserAt || null,
+      lastUserAt: view.lastUserAt || null,
     }
   }
 
@@ -868,10 +745,10 @@ export function apply(ctx, config = {}) {
       ok: true,
       path: store.filePath,
       lang: getLang(),
-      config: { ...cfg, apiKey: cfg.apiKey ? '***' + cfg.apiKey.slice(-4) : '' },
+      config: { ...cfg, apiKey: maskApiKey(cfg.apiKey) },
       defaults: defaultConfig(),
       nowMs: at,
-      agents: [...entries.entries()].map(([agent, item]) => describe(agent, item.entry)),
+      agents: [...entries.entries()].map(([agent, item]) => describe(agent, item.sessionId)),
       log: store.log.slice(-30).reverse(),
       weather: {
         at: Number(store.weather.at) || null,
@@ -903,36 +780,26 @@ export function apply(ctx, config = {}) {
     if (action === 'weather-now') { refreshWeather(true); return 1 }
     let affected = 0
     for (const [agent, item] of entries) {
-      const entry = item.entry
-      if (wanted && entry.sessionId !== wanted) continue
-      const st = refreshNight(entry.sessionId)
+      const sessionId = item.sessionId
+      if (wanted && sessionId !== wanted) continue
       const at = now()
-      if (action === 'sleep-now') {
-        st.sleepAtMs = at - 1000
-        st.wakeAtMs = at + 8 * 3600 * 1000
-        st.sleptMinutes = new Date(at).getHours() * 60 + new Date(at).getMinutes()
-        st.wokeMinutes = (st.sleptMinutes + 480) % 1440
-        st.awakeUntilMs = 0
-      } else if (action === 'wake-now') {
-        st.awakeUntilMs = 0
-        st.wakeAtMs = at - 1000
-      } else if (action === 'reset') {
-        delete store.state[entry.sessionId]
+      const cfg = store.config
+      // 先保证夜次是新的，等价于以前的 refreshNight
+      timeline.snapshot(sessionId, cfg, at)
+      if (action === 'reset') {
+        timeline.reset(sessionId)
       } else if (action === 'stir-now') {
-        stir(entry, 'debug')
-      } else if (action === 'skip') {
-        st.skipped = true
-      } else if (action === 'unskip') {
-        st.skipped = false
+        timeline.stir(sessionId, cfg, at, 'debug')
       } else if (action === 'act-now') {
-        fireAction(entry, agent)
+        if (timeline.forceAction(sessionId, cfg, at)) deliverAction(sessionId, agent, at)
       } else if (action === 'end-action') {
-        if (!finishAction(entry, agent, {})) continue
-      } else {
+        const finished = timeline.takeAction(sessionId)
+        if (!finished) continue
+        deliverActionDone(sessionId, agent, { action: finished, silent: false })
+      } else if (!timeline.debugApply(sessionId, at, action)) {
         return affected
       }
       affected += 1
-      if (action !== 'reset' && action !== 'stir-now' && action !== 'act-now') entry.phase = ''
     }
     store.persist()
     return affected
@@ -941,93 +808,83 @@ export function apply(ctx, config = {}) {
   if (typeof ctx.inject === 'function') {
     try {
       ctx.inject(['webServer'], (scope) => {
-        scope.webServer.register({
-          kind: 'exact',
-          path: ROUTE + '/status',
-          handler: (req, res) => {
-            if (req.method !== 'GET') { res.writeHead(405, { allow: 'GET' }); res.end(); return }
-            sendJson(res, 200, status())
-          },
+        /**
+         * 注册一条 JSON 路由：方法校验、异常兜底、响应编码都在这里，handler 只管业务。
+         *
+         * 下面五条本来就是同一个形状，各抄一遍的结果是那六行样板会慢慢长歪 ——
+         * 比如某一条忘了写 405，或者 catch 里换了别的形状。
+         *
+         * 二进制那条（下面的 /raw）不走这里：它回的是图片不是 JSON，状态码也不同。
+         */
+        const jsonRoute = (path, methods, handler) => {
+          scope.webServer.register({
+            kind: 'exact',
+            path,
+            handler: async (req, res) => {
+              if (!methods.includes(req.method)) {
+                res.writeHead(405, { allow: methods.join(', ') })
+                res.end()
+                return
+              }
+              try {
+                await handler(req, res)
+              } catch (error) {
+                sendJson(res, 400, { ok: false, error: String(error?.message || error) })
+              }
+            },
+          })
+        }
+
+        jsonRoute(ROUTE + '/status', ['GET'], (req, res) => {
+          sendJson(res, 200, status())
         })
+
         // 客户端把 ctx.locale 解析出的界面语言报上来——宿主侧没有 locale 服务，
         // 这是「让注入的提示词跟随 DSH 界面语言」的唯一途径。
-        scope.webServer.register({
-          kind: 'exact',
-          path: ROUTE + '/locale',
-          handler: async (req, res) => {
-            if (req.method !== 'POST') { res.writeHead(405, { allow: 'POST' }); res.end(); return }
-            try {
-              const body = await readJsonBody(req)
-              const next = setLang(body && body.lang)
-              if (next !== store.locale) { store.locale = next; store.persist() }
-              sendJson(res, 200, { ok: true, lang: next })
-            } catch (error) {
-              sendJson(res, 400, { ok: false, error: String(error?.message || error) })
-            }
-          },
+        jsonRoute(ROUTE + '/locale', ['POST'], async (req, res) => {
+          const body = await readJsonBody(req)
+          const next = setLang(body && body.lang)
+          if (next !== store.locale) { store.locale = next; store.persist() }
+          sendJson(res, 200, { ok: true, lang: next })
         })
-        scope.webServer.register({
-          kind: 'exact',
-          path: ROUTE + '/config',
-          handler: async (req, res) => {
-            try {
-              if (req.method === 'GET') { sendJson(res, 200, { ok: true, value: status().config, defaults: defaultConfig(), path: store.filePath }); return }
-              if (req.method !== 'POST') { res.writeHead(405, { allow: 'GET, POST' }); res.end(); return }
-              const body = await readJsonBody(req)
-              const incoming = body && typeof body.config === 'object' ? { ...body.config } : { ...body }
-              // '' / undefined = 「不改」；'***xxxx' 是面板回显的脱敏值，同样不能当成新 Key 写回去，
-              // 否则用户在面板里改任何别的设置再点保存，真实 Key 就会被这个掩码覆盖掉。
-              if (incoming.apiKey === '' || incoming.apiKey === undefined || /^\*{3}/.test(incoming.apiKey)) delete incoming.apiKey
-              const value = store.setConfig(incoming)
-              for (const [, item] of entries) refreshNight(item.entry.sessionId)
-              refreshWeather(false) // 城市改了要立刻重取（内部会比对目标城市）
-              sendJson(res, 200, { ok: true, value: { ...value, apiKey: value.apiKey ? '***' + value.apiKey.slice(-4) : '' } })
-            } catch (error) {
-              sendJson(res, 400, { ok: false, error: String(error?.message || error) })
-            }
-          },
+
+        jsonRoute(ROUTE + '/config', ['GET', 'POST'], async (req, res) => {
+          if (req.method === 'GET') { sendJson(res, 200, { ok: true, value: status().config, defaults: defaultConfig(), path: store.filePath }); return }
+          const body = await readJsonBody(req)
+          const incoming = body && typeof body.config === 'object' ? { ...body.config } : { ...body }
+          // '' / undefined = 「不改」；'***xxxx' 是面板回显的脱敏值，同样不能当成新 Key 写回去，
+          // 否则用户在面板里改任何别的设置再点保存，真实 Key 就会被这个掩码覆盖掉。
+          if (incoming.apiKey === '' || incoming.apiKey === undefined || isMaskedApiKey(incoming.apiKey)) delete incoming.apiKey
+          const value = store.setConfig(incoming)
+          for (const [, item] of entries) timeline.snapshot(item.sessionId, store.config, now())
+          refreshWeather(false) // 城市改了要立刻重取（内部会比对目标城市）
+          sendJson(res, 200, { ok: true, value: { ...value, apiKey: maskApiKey(value.apiKey) } })
         })
-        scope.webServer.register({
-          kind: 'exact',
-          path: ROUTE + '/debug',
-          handler: async (req, res) => {
-            if (req.method !== 'POST') { res.writeHead(405, { allow: 'POST' }); res.end(); return }
-            try {
-              const body = await readJsonBody(req)
-              sendJson(res, 200, { ok: true, affected: debug(body) })
-            } catch (error) {
-              sendJson(res, 400, { ok: false, error: String(error?.message || error) })
-            }
-          },
+
+        jsonRoute(ROUTE + '/debug', ['POST'], async (req, res) => {
+          const body = await readJsonBody(req)
+          sendJson(res, 200, { ok: true, affected: debug(body) })
         })
-        scope.webServer.register({
-          kind: 'exact',
-          path: ROUTE + '/clear',
-          handler: async (req, res) => {
-            if (req.method !== 'POST') { res.writeHead(405, { allow: 'POST' }); res.end(); return }
-            try {
-              const body = await readJsonBody(req)
-              const target = String(body.target || '')
-              if (target === 'log') {
-                const removed = store.log.length
-                store.log = []
-                store.persist()
-                logger.info?.(t('log.logCleared', { count: removed }))
-                sendJson(res, 200, { ok: true, removed })
-                return
-              }
-              if (target === 'apiKey') {
-                // 直接 setConfig：/config 那条路把空字符串当成"不修改"，这里要的是真清掉
-                store.setConfig({ apiKey: '' })
-                logger.info?.(t('log.keyCleared'))
-                sendJson(res, 200, { ok: true })
-                return
-              }
-              sendJson(res, 400, { ok: false, error: t('err.config.unknownTarget', { target }) })
-            } catch (error) {
-              sendJson(res, 400, { ok: false, error: String(error?.message || error) })
-            }
-          },
+
+        jsonRoute(ROUTE + '/clear', ['POST'], async (req, res) => {
+          const body = await readJsonBody(req)
+          const target = String(body.target || '')
+          if (target === 'log') {
+            const removed = store.log.length
+            store.log = []
+            store.persist()
+            logger.info?.(t('log.logCleared', { count: removed }))
+            sendJson(res, 200, { ok: true, removed })
+            return
+          }
+          if (target === 'apiKey') {
+            // 直接 setConfig：/config 那条路把空字符串当成"不修改"，这里要的是真清掉
+            store.setConfig({ apiKey: '' })
+            logger.info?.(t('log.keyCleared'))
+            sendJson(res, 200, { ok: true })
+            return
+          }
+          sendJson(res, 400, { ok: false, error: t('err.config.unknownTarget', { target }) })
         })
         // 前缀路由不能带结尾斜杠，否则 DSH 匹配不上（踩过的坑）。
         scope.webServer.register({

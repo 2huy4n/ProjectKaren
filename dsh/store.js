@@ -3,20 +3,28 @@ import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'node:fs'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { normalizeBirthday } from './events.mjs'
-import { t, dicts } from './i18n.mjs'
-
-/**
- * 历史上被"冻结"进配置的各语言默认值。
- * photoPrompt 的默认值是一句会随语言变化的文案，旧版本把它物化后落盘了；
- * 装载时认出这些值就等于「其实没设过」，还原成空串让它重新跟随语言。
- */
-const KNOWN_PHOTO_DEFAULTS = new Set(
-  Object.values(dicts).map((d) => d['default.photoPrompt']).filter(Boolean),
-)
+import { isDefaultText, t } from './i18n.mjs'
 
 export function configPath() {
   const home = process.env.DSH_HOME || path.join(homedir(), '.dsh')
   return path.join(home, 'project-karen.json')
+}
+
+/**
+ * apiKey 在线上（面板看到的那份）长什么样：只留末 4 位。
+ *
+ * 这个约定必须和 isMaskedApiKey 成对使用，所以两者放在一起、放在配置模块里 ——
+ * 之前 /status 与 /config 各自抄了一遍这个表达式，改一处忘一处的话，同一个 key
+ * 在面板里会一会儿一个样。
+ */
+export function maskApiKey(value) {
+  const key = typeof value === 'string' ? value : ''
+  return key ? '***' + key.slice(-4) : ''
+}
+
+/** 面板回显的脱敏值（不是用户新输入的 key），回传时必须认出来并丢弃。 */
+export function isMaskedApiKey(value) {
+  return /^\*{3}/.test(String(value == null ? '' : value))
 }
 
 export function defaultConfig() {
@@ -101,7 +109,7 @@ function clockOrBlank(value, fallback) {
 function photoPromptOf(value) {
   const raw = typeof value === 'string' ? value.trim() : ''
   if (!raw) return ''
-  if (KNOWN_PHOTO_DEFAULTS.has(raw)) return '' // 旧版本冻结进去的默认值 → 还原成"没设过"
+  if (isDefaultText('default.photoPrompt', raw)) return '' // 旧版本冻结进去的默认值 → 还原成"没设过"
   return raw.slice(0, 800)
 }
 
@@ -185,14 +193,6 @@ export class Store {
   }
 
   get offsetMs() { return this.config.offsetMinutes * 60000 }
-
-  sessionState(sessionId) {
-    const current = this.state[sessionId]
-    if (current && typeof current === 'object') return current
-    const fresh = {}
-    this.state[sessionId] = fresh
-    return fresh
-  }
 
   setConfig(patch) {
     this.config = normalizeConfig({ ...this.config, ...(patch || {}) })
