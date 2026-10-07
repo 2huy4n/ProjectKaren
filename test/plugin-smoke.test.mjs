@@ -38,9 +38,8 @@ check('六个路由注册齐（status/locale/config/debug/clear + prefix raw）'
 check('两个工具注册齐', night.tools.has('karen_photo') && night.tools.has('karen_action'),
   [...night.tools.keys()].join(', '))
 check('/mute 命令注册了', night.commands.has('mute'))
-check('系统提示词分节只剩相机那条（静态能力说明）', night.sections.size === 1 && night.sections.has('project-karen-camera'),
-  [...night.sections.keys()].join(', '))
-check('睡眠/动作/今天三块注册成运行时上下文', night.contexts.size === 3, [...night.contexts.keys()].join(', '))
+check('系统提示词分节：睡眠/动作/相机三条（倒计时不在分节里）', night.sections.size === 3, [...night.sections.keys()].join(', '))
+check('运行时上下文：今天 + 睡眠倒计时 + 动作倒计时', night.contexts.size === 3, [...night.contexts.keys()].join(', '))
 check('没有告警（注册过程干净）', night.warnings.length === 0, night.warnings.join(' | '))
 
 console.log('\n2. 心跳：假定时器接管了 tick')

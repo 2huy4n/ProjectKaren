@@ -1,14 +1,20 @@
 #!/usr/bin/env node
-// 前缀缓存稳定性：会变的数字只许出现在运行时上下文里，不许出现在系统提示词里。
+// 注入通道的不变量：会变的数字只许出现在运行时上下文里，分节只在状态翻转时才变。
 //
 // 背景（用户报的 issue）：睡眠文案里有「还有 XX 分钟会醒」，动作文案里有「已经过去 /
 // 还剩 XX 分钟」—— 每分钟变一次。而系统提示词在请求最前面，DeepSeek 是前缀缓存：
 // 前面一变，从那里往后的整段历史全部按未命中价重算。
 //
-// 这个文件不测「注入了什么」（那是 plugin-smoke 的事），测的是「注入通道选对了没有」：
-//   1. 模拟一整天逐分钟采样 —— 系统提示词分节必须逐字节不变；
-//   2. 同一批采样里分钟数照旧在运行时上下文里跳动 —— 功能没丢；
-//   3. 三块逐请求事实注册在 contexts，静态的相机说明注册在 sections。
+// 修法不是「把整块都挪进上下文」，而是按变化频率切开：
+//   · 分节（系统提示词）：「你现在在睡觉 / 你正在做饭」+ 规矩 —— 只在入睡、醒来、
+//     开工、收工那一分钟变。
+//   · 上下文（追加在已缓存历史之后的快照）：只剩倒计时那几个数字，每分钟变。
+// 为什么分节不能整块搬走：部署方（或 agent preset）可以 includeRuntimeContext:false
+// 把运行时上下文整体关掉，那时至少「她在睡觉，别回应内容」这条规矩得留下。
+//
+// 这个文件测的就是上面这套分工，外加两条边界：
+//   A. 被抑制的部署里，分节仍然交代状态与规矩，只是没有分钟数。
+//   B. 只填了「用户城市」时，主城市取它，天气照样取到（不再反过来告诉模型"取不到"）。
 //
 // 用法：npm test
 import { startKaren } from './harness.mjs'
@@ -38,70 +44,149 @@ const FIXED = {
   weatherEnabled: false,
 }
 
-/** 系统提示词那一半的完整形态（名字 + 文本）；一变就说明前缀要重算。 */
+/** 模型看到的系统提示词那半边的完整形态（名字 + 文本）；一变就说明前缀要重算。 */
 const sectionShape = (karen) => karen.prompts()
   .filter((item) => item.kind === 'section')
   .map((item) => item.name + '\u0000' + item.text)
   .join('\n')
 
-console.log('\n1. 通道：会变的事实走运行时上下文，静态能力说明留在系统提示词')
+console.log('\n1. 通道：倒计时走运行时上下文，状态与规矩留在系统提示词')
 await withKaren({ startAt: at(14, 0), config: FIXED }, async (karen) => {
-  const volatile = ['project-karen-sleep', 'project-karen-action', 'project-karen-context']
-  check('睡眠/动作/今天三块都在 contexts 里',
-    volatile.every((name) => karen.contexts.has(name)),
-    [...karen.contexts.keys()].join(', '))
-  check('而且都不在 sections 里',
-    volatile.every((name) => !karen.sections.has(name)),
-    [...karen.sections.keys()].join(', '))
-  check('相机那条（静态）留在 sections 里',
-    karen.sections.has('project-karen-camera') && !karen.contexts.has('project-karen-camera'))
-  check('顺序排在框架自带的三条上下文（110/115/120）之后',
-    volatile.every((name) => karen.contexts.get(name).order > 120),
-    volatile.map((name) => `${name}=${karen.contexts.get(name).order}`).join(', '))
+  const sections = [...karen.sections.keys()].sort().join(', ')
+  const contexts = [...karen.contexts.keys()].sort().join(', ')
+  check('分节三条：睡眠 / 动作 / 相机',
+    sections === 'project-karen-action, project-karen-camera, project-karen-sleep', sections)
+  check('上下文三条：动作倒计时 / 今天 / 睡眠倒计时',
+    contexts === 'project-karen-action-clock, project-karen-context, project-karen-sleep-clock', contexts)
+  check('上下文的顺序排在框架自带的 110/115/120 之后',
+    [...karen.contexts.values()].every((spec) => spec.order > 120),
+    [...karen.contexts.entries()].map(([n, s]) => `${n}=${s.order}`).join(', '))
 })
 
-console.log('\n2. 一整天逐分钟采样：系统提示词逐字节不变，分钟数照旧在跳')
+console.log('\n2. 一整天逐分钟采样：同一状态内分节逐字节不变，倒计时照旧在跳')
 await withKaren({ startAt: at(6, 0), config: FIXED }, async (karen) => {
   const shapes = new Set()
-  const sleepTexts = new Set()
+  const clockTexts = new Set()
+  const violations = []
+  let prevPhase = null
+  let prevShape = null
   for (let i = 0; i < 24 * 60; i += 1) {
-    shapes.add(sectionShape(karen))
-    const sleep = karen.promptOf('project-karen-sleep')
-    if (sleep) sleepTexts.add(sleep)
+    const phase = (await karen.snapshot()).phase
+    const shape = sectionShape(karen)
+    shapes.add(shape)
+    if (prevPhase !== null && phase === prevPhase && shape !== prevShape) violations.push(i)
+    prevPhase = phase
+    prevShape = shape
+    const clock = karen.promptOf('project-karen-sleep-clock')
+    if (clock) clockTexts.add(clock)
     karen.advance(MIN)
   }
 
-  check('这一天里确实睡着过（否则下面两条断言是空的）', sleepTexts.size > 1, `${sleepTexts.size} 段睡眠文案`)
-  check('睡眠文案里的分钟数照旧每分钟在变', sleepTexts.size > 10, `${sleepTexts.size} 种`)
-  check('24 小时里系统提示词只有一种形态', shapes.size === 1, `${shapes.size} 种形态`)
-  check('系统提示词里没有分钟数', ![...shapes][0].includes('分钟'), String([...shapes][0]).slice(0, 160))
+  check('1440 次采样里，同一状态内分节 0 次变化',
+    violations.length === 0, `违规 ${violations.length} 次，最早第 ${violations[0]} 分钟`)
+  check('这一天里状态确实翻转过（否则上一条是空断言）', shapes.size === 2, `${shapes.size} 种形态`)
+  check('睡眠倒计时照旧每分钟在变', clockTexts.size > 10, `${clockTexts.size} 种`)
+  check('分节里没有倒计时（「还有约 …分钟」只在上下文里）',
+    [...shapes].every((s) => !s.includes('还有约')), String([...shapes].find((s) => s.includes('还有约'))).slice(0, 80))
 })
 
-console.log('\n3. 自由动作全程：语境每分钟在变，系统提示词纹丝不动')
+console.log('\n3. 自由动作全程：倒计时每分钟在变，分节只在开工/收工那两分钟变')
 await withKaren({ startAt: at(14, 0), config: FIXED }, async (karen) => {
-  const before = sectionShape(karen)
+  const idleShape = sectionShape(karen)
   karen.tools.get('karen_action').execute({ label: '做饭', minutes: 30 }, { agent: karen.agent })
+  const busyShape = sectionShape(karen)
 
-  const shapes = new Set()
-  const actionTexts = new Set()
-  for (let i = 0; i < 35; i += 1) {
-    shapes.add(sectionShape(karen))
-    const action = karen.promptOf('project-karen-action')
-    if (action) actionTexts.add(action)
+  check('开工那一分钟分节确实变了（状态翻转）', busyShape !== idleShape)
+  check('分节里有「你正在」，但没有倒计时',
+    busyShape.includes('你正在') && !busyShape.includes('还剩约'), busyShape.slice(0, 80))
+
+  const during = new Set()
+  const clockTexts = new Set()
+  for (let i = 0; i < 25; i += 1) {
+    during.add(sectionShape(karen))
+    const clock = karen.promptOf('project-karen-action-clock')
+    if (clock) clockTexts.add(clock)
     karen.advance(MIN)
     await karen.tickAndSettle()
   }
+  check('动作进行中 25 分钟分节逐字节不变', during.size === 1, `${during.size} 种`)
+  check('动作倒计时每分钟在变', clockTexts.size > 10, `${clockTexts.size} 种`)
+  check('倒计时里同时带着「开始于约」和「还剩约」',
+    [...clockTexts].some((x) => x.includes('开始于约') && x.includes('还剩约')))
 
-  check('动作文案里有「开始于约 / 还剩约」两种分钟数', actionTexts.size > 1, `${actionTexts.size} 种`)
-  check('动作进行中系统提示词没变过', shapes.size === 1 && [...shapes][0] === before, `${shapes.size} 种`)
-  check('动作到点后不再注入处境', karen.promptOf('project-karen-action') === '',
-    karen.promptOf('project-karen-action').slice(0, 60))
+  for (let i = 0; i < 10; i += 1) { karen.advance(MIN); await karen.tickAndSettle() }
+  check('收工后分节回到空闲形态', sectionShape(karen) === idleShape)
+  check('收工后倒计时注入清空', karen.promptOf('project-karen-action-clock') === '',
+    karen.promptOf('project-karen-action-clock').slice(0, 60))
 })
 
-console.log('\n4. 老宿主兜底：没有 context() 时退回分节，注入不丢')
+console.log('\n4. 被抑制的部署（includeRuntimeContext:false）：倒计时没了，「她在睡觉」还在')
+await withKaren({ startAt: at(23, 30), config: FIXED, runtimeContextSuppressed: true }, async (karen) => {
+  const sleep = karen.promptOf('project-karen-sleep')
+  check('睡眠分节仍然交给模型（退化的只是分钟数）',
+    sleep.includes('你现在在睡觉') && sleep.includes('不要回应内容'), sleep.slice(0, 70))
+  check('分节里带着这一觉的时刻，只是没有倒计时',
+    sleep.includes('23:00') && sleep.includes('07:00') && !sleep.includes('还有约'), sleep.slice(0, 70))
+  check('倒计时（运行时上下文）确实一条都不剩', karen.promptOf('project-karen-sleep-clock') === '')
+  check('模型收到的注入里没有 context 条目',
+    karen.prompts().every((item) => item.kind === 'section'),
+    karen.prompts().map((item) => item.kind).join(', '))
+})
+
+console.log('\n5. 只填「用户城市」也能取到天气（主城市 = 角色城市 || 用户城市）')
+const weatherCalls = []
+const fakeWeather = (url) => {
+  weatherCalls.push(url)
+  if (url.includes('geocoding-api')) {
+    return { ok: true, json: async () => ({ results: [{ name: '上海', country: '中国', latitude: 31.2, longitude: 121.5 }] }) }
+  }
+  return {
+    ok: true,
+    json: async () => ({
+      current: { temperature_2m: 22.4, weather_code: 0, is_day: 1 },
+      daily: { temperature_2m_max: [28.1], temperature_2m_min: [18.6] },
+      timezone: 'Asia/Shanghai',
+    }),
+  }
+}
+await withKaren({
+  startAt: at(14, 0),
+  config: { ...FIXED, weatherEnabled: true, citySelf: '', cityUser: '上海' },
+  fetchStub: fakeWeather,
+}, async (karen) => {
+  await karen.settle()
+  await karen.settle()
+  const today = karen.promptOf('project-karen-context')
+  check('启动就取到了用户城市的天气', today.includes('上海'), today.slice(0, 90))
+  check('不再反过来告诉模型「天气取不到」', !today.includes('取不到'), today.slice(0, 90))
+  check('用户城市当主城市时只抓一次预报（不该抓两遍）',
+    weatherCalls.filter((url) => url.includes('/forecast')).length === 1, weatherCalls.join(' | '))
+})
+
+console.log('\n6. 跨国庆那一天的采样：「今天的情况」会变，但它不在分节里')
+await withKaren({ startAt: at(12, 0, 30), config: FIXED }, async (karen) => {
+  const shapes = new Set()
+  const todayTexts = new Set()
+  for (let i = 0; i < 24 * 60; i += 1) {
+    shapes.add(sectionShape(karen))
+    todayTexts.add(karen.promptOf('project-karen-context'))
+    karen.advance(MIN)
+  }
+
+  check('跨过 10-01 那一刻「今天的情况」确实变了（否则下面两条是空断言）',
+    todayTexts.size >= 2, `${todayTexts.size} 种`)
+  check('而分节仍然只有睡着/醒着两种形态（今天的情况留在上下文里）',
+    shapes.size === 2, `${shapes.size} 种`)
+  check('分节里没有混进节日文案',
+    [...shapes].every((s) => !s.includes('国庆')), String([...shapes].find((s) => s.includes('国庆'))).slice(0, 80))
+})
+
+console.log('\n7. 老宿主兜底：没有 context() 时整块退回分节，注入不丢')
 await withKaren({ startAt: at(23, 30), config: FIXED, legacyPromptService: true }, async (karen) => {
-  check('睡眠文案还在（只是走分节、要付缓存的钱）',
-    karen.sections.has('project-karen-sleep') && karen.promptOf('project-karen-sleep').length > 0)
+  const sleep = karen.promptOf('project-karen-sleep')
+  check('睡眠文案还在（含倒计时，只是要付前缀缓存的钱）',
+    sleep.includes('你现在在睡觉') && karen.promptOf('project-karen-sleep-clock').includes('还有约'),
+    karen.promptOf('project-karen-sleep-clock').slice(0, 60))
   check('运行时上下文一个也没注册（老宿主没有这个 API）', karen.contexts.size === 0)
 })
 

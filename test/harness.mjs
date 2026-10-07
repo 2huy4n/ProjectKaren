@@ -15,8 +15,9 @@
 //      点火；否则一次 tick 要真等 20 秒，调度相关的断言没法写。
 //   4. 假事件总线 —— 记住 ctx.on / agent.ctx.on 注册的处理器，测试可以投递
 //      session/event，从而触发「用户说了话」这条路径下的吵醒与问候。
+//   5. 假网络 —— 接管全局 fetch，默认直接抛，免得测试偷偷联网。
 //
-// 产品代码一行都不改：靠的是在 import dsh/index.js 之前替换两个全局。
+// 产品代码一行都不改：靠的是在 import dsh/index.js 之前替换几个全局。
 //
 // 用法：
 //   import { startKaren } from './harness.mjs'
@@ -65,13 +66,14 @@ export function validateMessage(message) {
 // 与其让它悄悄污染，不如在第二次启动时当场炸掉。
 let live = null
 
-export async function startKaren({ config = {}, sessionId = 'sess-1', lang = 'zh', startAt, legacyPromptService = false } = {}) {
+export async function startKaren({ config = {}, sessionId = 'sess-1', lang = 'zh', startAt, legacyPromptService = false, runtimeContextSuppressed = false, fetchStub } = {}) {
   if (live) {
     throw new Error('harness: 已有实例在运行（假时钟是进程级的）。请先 stop() 上一个再启动。')
   }
   const realNow = Date.now
   const realSetInterval = globalThis.setInterval
   const realClearInterval = globalThis.clearInterval
+  const realFetch = globalThis.fetch
 
   const dir = mkdtempSync(path.join(tmpdir(), 'karen-harness-'))
   process.env.DSH_HOME = dir
@@ -93,6 +95,14 @@ export async function startKaren({ config = {}, sessionId = 'sess-1', lang = 'zh
     const at = intervals.indexOf(handle)
     if (at >= 0) intervals.splice(at, 1)
   }
+
+  // ── 假网络 ────────────────────────────────────────────────────────
+  // 天气走全局 fetch。默认直接抛：测试不该偷偷发真实请求（此前 plugin-smoke 里
+  // 那次「改成杭州」就在后台真连了 Open-Meteo），顺便让「取不到天气」这条降级
+  // 路径变成可判定的。要真走通天气就传 fetchStub(url) → { ok, json }。
+  globalThis.fetch = fetchStub
+    ? (url, init) => Promise.resolve(fetchStub(String(url), init))
+    : () => Promise.reject(new Error('harness: 测试里不发网络请求（需要天气请传 fetchStub）'))
 
   const i18n = await load('dsh/i18n.mjs')
   i18n.setLang(lang)
@@ -284,16 +294,25 @@ export async function startKaren({ config = {}, sessionId = 'sess-1', lang = 'zh
       return (body && body.agents && body.agents[0]) || null
     },
 
-    /** 注入给模型的文本；name 见 index.js 的 'project-karen-*'（分节或运行时上下文都认）。 */
+    /**
+     * 注入给模型的文本；name 见 index.js 的 'project-karen-*'（分节或运行时上下文都认）。
+     * runtimeContextSuppressed 时上下文一条都不到模型面前 —— 对应宿主 assemble() 里的
+     * `runtimeContextSuppressed ? [] : …`（部署或 agent preset 设 includeRuntimeContext:false）。
+     */
     promptOf(name) {
-      const spec = sections.get(name) || contexts.get(name)
-      return spec ? spec.text() : ''
+      const section = sections.get(name)
+      if (section) return section.text()
+      if (runtimeContextSuppressed) return ''
+      const context = contexts.get(name)
+      return context ? context.text() : ''
     },
-    /** 所有注入的 { name, kind, text }；kind 是 'section' 或 'context'。 */
+    /** 模型实际收到的注入，{ name, kind, text }；kind 是 'section' 或 'context'。 */
     prompts() {
       return [
         ...[...sections.entries()].map(([name, spec]) => ({ name, kind: 'section', text: spec.text() })),
-        ...[...contexts.entries()].map(([name, spec]) => ({ name, kind: 'context', text: spec.text() })),
+        ...runtimeContextSuppressed
+          ? []
+          : [...contexts.entries()].map(([name, spec]) => ({ name, kind: 'context', text: spec.text() })),
       ]
     },
 
@@ -323,6 +342,7 @@ export async function startKaren({ config = {}, sessionId = 'sess-1', lang = 'zh
       Date.now = realNow
       globalThis.setInterval = realSetInterval
       globalThis.clearInterval = realClearInterval
+      globalThis.fetch = realFetch
       rmSync(dir, { recursive: true, force: true })
       delete process.env.DSH_HOME
       if (live === harness) live = null

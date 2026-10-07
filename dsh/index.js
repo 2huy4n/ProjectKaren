@@ -13,8 +13,14 @@
 //   · systemPrompt.section() —— 常驻系统提示词。只在状态整段翻转时才该变。
 //   · systemPrompt.context() —— 逐请求事实。追加在已缓存历史之后的一条快照，
 //                               而且只在文本真的变了时才追加。
-// 「睡着 / 正在忙 / 今天什么天气」都带着每分钟会变的分钟数，属于后者：写进分节就等于
-// 每分钟把请求最前面的系统提示词改一遍，DeepSeek 的前缀缓存从那里往后全部按未命中重算。
+// 所以「你现在在睡觉 / 你正在做饭」连同规矩留在分节（只在入睡、醒来、开工、收工那一分钟变），
+// 而「还有约 42 分钟会醒」「已经过去 12 分钟」这类每分钟都会变的数字一律走上下文 —— 写进分节
+// 就等于每分钟把请求最前面的系统提示词改一遍，DeepSeek 的前缀缓存从那里往后全部按未命中重算。
+//
+// 为什么不干脆把整块都塞进 context：部署方（或某个 agent preset）可以用
+// includeRuntimeContext:false / suppressRuntimeContext() 把运行时上下文整体关掉
+// （见 @deepseek-ai/dsh-persona）。那时 context 一条都不剩，分节却还在 ——
+// 至少「她在睡觉，别回应内容」这条规矩不会跟着消失，退化的只是分钟数。
 
 import { randomUUID } from 'node:crypto'
 import { Store, configPath, defaultConfig, isMaskedApiKey, maskApiKey } from './store.js'
@@ -48,13 +54,23 @@ async function readJsonBody(req) {
 const pad2 = (n) => String(n).padStart(2, '0')
 const hhmm = (d) => pad2(d.getHours()) + ':' + pad2(d.getMinutes())
 
-function sleepPrompt(st, cfg, nowMs) {
+/**
+ * 睡眠中：规矩 + "这一觉"的时刻。它们只在入睡/醒来的那一分钟变，所以留在系统提示词分节里。
+ * 唯一会每分钟变的那部分（还有几分钟醒）另外走 sleepClockText —— 见文件头的「注入通道」。
+ */
+function sleepSectionText(st, cfg) {
   return t('prompt.sleep', {
     sleptAt: formatClock(st.sleptMinutes),
     wakeAt: hhmm(new Date(st.wakeAtMs)),
-    left: Math.max(0, Math.round((st.wakeAtMs - nowMs) / 60000)),
     window: cfg.barrageWindowMinutes,
     count: cfg.barrageCount,
+  })
+}
+
+/** 睡眠里唯一每分钟都会变的部分：离醒来还有多久。 */
+function sleepClockText(st, nowMs) {
+  return t('prompt.sleep.clock', {
+    left: Math.max(0, Math.round((st.wakeAtMs - nowMs) / 60000)),
   })
 }
 
@@ -62,15 +78,27 @@ function actionPrompt() {
   return t('prompt.action')
 }
 
-/** 正在做某件事时，注入"我此刻的处境"——重点是：照样能回消息。 */
-function actionSectionText(st, nowMs) {
+/**
+ * 正在做某件事时，注入"我此刻的处境"——重点是：照样能回消息。
+ * label / motive 在整件事里都不变，属于分节；"过去多少、还剩多少"走 actionClockText。
+ */
+function actionSectionText(st) {
   const a = st.action
   if (!a) return ''
   return t('prompt.actionSection', {
     label: a.label,
+    motive: a.motive ? t('prompt.actionSection.motive', { motive: a.motive }) : '',
+  })
+}
+
+/** 做事途中唯一每分钟都会变的部分：已经过去多少、还剩多少。 */
+function actionClockText(st, nowMs) {
+  const a = st.action
+  if (!a) return ''
+  return t('prompt.actionSection.clock', {
+    label: a.label,
     passed: Math.max(0, Math.round((nowMs - a.startedAt) / 60000)),
     left: Math.max(0, Math.round((a.endsAt - nowMs) / 60000)),
-    motive: a.motive ? t('prompt.actionSection.motive', { motive: a.motive }) : '',
   })
 }
 
@@ -198,21 +226,27 @@ export function apply(ctx, config = {}) {
 
   const refreshWeather = async (force) => {
     const cfg = store.config
-    if (!cfg.weatherEnabled || !cfg.citySelf) return false
+    // 主城市：角色城市优先，没填就用用户城市。面板上「只填了一个」时也得取到天气 ——
+    // 只认 citySelf 的话，用户填了合法的「用户城市」也永远取不到，而且提示词还会
+    // 反过来告诉她「天气暂时取不到」，让她反复跟用户说查不到天气。
+    const primary = cfg.citySelf || cfg.cityUser
+    if (!cfg.weatherEnabled || !primary) return false
     if (weatherBusy) return false
-    const sameTargets = store.weather.selfCity === cfg.citySelf && (store.weather.userCity || '') === (cfg.cityUser || '')
+    const sameTargets = store.weather.selfCity === primary && (store.weather.userCity || '') === (cfg.cityUser || '')
     if (!force && sameTargets && now() - (Number(store.weather.at) || 0) < WEATHER_TTL_MS) return false
     weatherBusy = true
     try {
       const lang = getLang()
-      const self = await fetchWeather(cfg.citySelf, lang)
+      const self = await fetchWeather(primary, lang)
       if (!self) {
-        logger.warn?.(t('log.weatherCityNotFound', { city: cfg.citySelf }))
+        logger.warn?.(t('log.weatherCityNotFound', { city: primary }))
         return false
       }
-      const needUser = !!cfg.cityUser && cfg.cityUser !== cfg.citySelf
+      // 只有两座城市都填了、而且真的不同，才需要第二次抓取：只填用户城市时它就是主城市，
+      // 那一次抓取已经拿到了，不该再抓一遍。
+      const needUser = !!cfg.citySelf && !!cfg.cityUser && cfg.cityUser !== cfg.citySelf
       const user = needUser ? await fetchWeather(cfg.cityUser, lang) : null
-      store.weather = { at: now(), selfCity: cfg.citySelf, userCity: cfg.cityUser || '', self, user }
+      store.weather = { at: now(), selfCity: primary, userCity: cfg.cityUser || '', self, user }
       store.persist()
       return true
     } catch (error) {
@@ -410,9 +444,24 @@ export function apply(ctx, config = {}) {
         logger.info?.(t('log.newSessionMuted', { session: sessionId }))
       }
       const cleanup = agent.ctx.effect(() => {
-        // 顺序落在框架自己的三条运行时上下文（沙箱策略 110 / 审批策略 115 / 子代理委派 120）之后。
-        const sleepInjection = contribute(agent, 'context', {
+        // 分节（系统的常驻文本）与运行时上下文（每条追加的快照）分工见文件头「注入通道」。
+        // 规矩是：分节只在状态整段翻转的那一分钟才变；任何每分钟都会变的数字，一律走上下文。
+        // 上下文的顺序落在框架自己的三条（沙箱策略 110 / 审批策略 115 / 子代理委派 120）之后。
+        const sleepInjection = contribute(agent, 'section', {
           name: 'project-karen-sleep',
+          order: 60,
+          text: () => {
+            try {
+              const cfg = store.config
+              if (!cfg.enabled) return ''
+              const view = timeline.snapshot(sessionId, cfg, now())
+              if (!view || view.skipped) return ''
+              return view.phase === 'asleep' ? sleepSectionText(view, cfg) : ''
+            } catch { return '' }
+          },
+        })
+        const sleepClockInjection = contribute(agent, 'context', {
+          name: 'project-karen-sleep-clock',
           order: 131,
           text: () => {
             try {
@@ -420,12 +469,26 @@ export function apply(ctx, config = {}) {
               if (!cfg.enabled) return ''
               const view = timeline.snapshot(sessionId, cfg, now())
               if (!view || view.skipped) return ''
-              return view.phase === 'asleep' ? sleepPrompt(view, cfg, now()) : ''
+              return view.phase === 'asleep' ? sleepClockText(view, now()) : ''
             } catch { return '' }
           },
         })
-        const actionInjection = contribute(agent, 'context', {
+        const actionInjection = contribute(agent, 'section', {
           name: 'project-karen-action',
+          order: 61,
+          text: () => {
+            try {
+              const cfg = store.config
+              if (!cfg.enabled) return ''
+              const view = timeline.snapshot(sessionId, cfg, now())
+              if (!view || view.skipped) return ''
+              if (view.phase !== 'awake') return ''
+              return actionSectionText(view)
+            } catch { return '' }
+          },
+        })
+        const actionClockInjection = contribute(agent, 'context', {
+          name: 'project-karen-action-clock',
           order: 132,
           text: () => {
             try {
@@ -434,7 +497,7 @@ export function apply(ctx, config = {}) {
               const view = timeline.snapshot(sessionId, cfg, now())
               if (!view || view.skipped) return ''
               if (view.phase !== 'awake') return ''
-              return actionSectionText(view, now())
+              return actionClockText(view, now())
             } catch { return '' }
           },
         })
@@ -453,7 +516,7 @@ export function apply(ctx, config = {}) {
             } catch { return '' }
           },
         })
-        // 相机那条跟当前状态无关，只在配置变化时才变 —— 唯一该留在系统提示词里的。
+        // 相机那条跟当前状态无关，只在配置变化时才变。
         const cameraInjection = contribute(agent, 'section', {
           name: 'project-karen-camera',
           order: 62,
@@ -487,7 +550,9 @@ export function apply(ctx, config = {}) {
           try { clearInterval(timer) } catch {}
           try { offEvent() } catch {}
           try { sleepInjection() } catch {}
+          try { sleepClockInjection() } catch {}
           try { actionInjection() } catch {}
+          try { actionClockInjection() } catch {}
           try { todayInjection() } catch {}
           try { cameraInjection() } catch {}
         }
