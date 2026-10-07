@@ -65,7 +65,7 @@ export function validateMessage(message) {
 // 与其让它悄悄污染，不如在第二次启动时当场炸掉。
 let live = null
 
-export async function startKaren({ config = {}, sessionId = 'sess-1', lang = 'zh', startAt } = {}) {
+export async function startKaren({ config = {}, sessionId = 'sess-1', lang = 'zh', startAt, legacyPromptService = false } = {}) {
   if (live) {
     throw new Error('harness: 已有实例在运行（假时钟是进程级的）。请先 stop() 上一个再启动。')
   }
@@ -102,6 +102,7 @@ export async function startKaren({ config = {}, sessionId = 'sess-1', lang = 'zh
   const delivered = []   // 插件投进会话的消息（= 角色说了什么）
   const problems = []    // 不合规的投递（宿主会拒绝的形状）
   const sections = new Map()  // 注入系统提示词的分节，按 name 索引
+  const contexts = new Map()  // 注入运行时上下文的事实快照，按 name 索引
   const tools = new Map()
   const routes = []
   const commands = new Map()
@@ -136,6 +137,10 @@ export async function startKaren({ config = {}, sessionId = 'sess-1', lang = 'zh
       on,
       systemPrompt: {
         section(spec) { sections.set(spec.name, spec); return () => sections.delete(spec.name) },
+        // 老宿主只有 section()：用来验证插件的兜底路径（注入不丢，只是付缓存的钱）。
+        ...legacyPromptService ? {} : {
+          context(spec) { contexts.set(spec.name, spec); return () => contexts.delete(spec.name) },
+        },
       },
     },
   }
@@ -216,6 +221,7 @@ export async function startKaren({ config = {}, sessionId = 'sess-1', lang = 'zh
     delivered,
     problems,
     sections,
+    contexts,
     tools,
     routes,
     commands,
@@ -278,14 +284,17 @@ export async function startKaren({ config = {}, sessionId = 'sess-1', lang = 'zh
       return (body && body.agents && body.agents[0]) || null
     },
 
-    /** 注入给模型的分节文本；name 见 index.js 的 'project-karen-*'。 */
+    /** 注入给模型的文本；name 见 index.js 的 'project-karen-*'（分节或运行时上下文都认）。 */
     promptOf(name) {
-      const spec = sections.get(name)
+      const spec = sections.get(name) || contexts.get(name)
       return spec ? spec.text() : ''
     },
-    /** 所有分节的 { name, text }，方便整体断言。 */
+    /** 所有注入的 { name, kind, text }；kind 是 'section' 或 'context'。 */
     prompts() {
-      return [...sections.entries()].map(([name, spec]) => ({ name, text: spec.text() }))
+      return [
+        ...[...sections.entries()].map(([name, spec]) => ({ name, kind: 'section', text: spec.text() })),
+        ...[...contexts.entries()].map(([name, spec]) => ({ name, kind: 'context', text: spec.text() })),
+      ]
     },
 
     readDisk() { return JSON.parse(readFileSync(configFile, 'utf8')) },

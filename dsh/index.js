@@ -8,6 +8,13 @@
 //   5) 提供 karen_photo 工具：角色"拍到照片"时调用它，图片以卡片形式出现在角色那一侧
 //
 // 角色卡/世界观不由本插件提供：假设会话里已经有角色；没写世界观时默认现实世界的中国。
+//
+// 注入通道只有两种，选错要付前缀缓存的钱（宿主侧细节见 @deepseek-ai/dsh-system-prompt）：
+//   · systemPrompt.section() —— 常驻系统提示词。只在状态整段翻转时才该变。
+//   · systemPrompt.context() —— 逐请求事实。追加在已缓存历史之后的一条快照，
+//                               而且只在文本真的变了时才追加。
+// 「睡着 / 正在忙 / 今天什么天气」都带着每分钟会变的分钟数，属于后者：写进分节就等于
+// 每分钟把请求最前面的系统提示词改一遍，DeepSeek 的前缀缓存从那里往后全部按未命中重算。
 
 import { randomUUID } from 'node:crypto'
 import { Store, configPath, defaultConfig, isMaskedApiKey, maskApiKey } from './store.js'
@@ -370,6 +377,20 @@ export function apply(ctx, config = {}) {
     }
   }
 
+  /**
+   * 注册一段注入。
+   *   kind='context' —— 逐请求事实：宿主渲染成追加在已缓存历史之后的快照，文本没变就不追加。
+   *   kind='section' —— 常驻系统提示词分节：只有与当前状态无关的文本才配放这里。
+   * 老宿主没有 context() 时退回 section：注入还在，只是要付前缀缓存的钱。
+   */
+  const contribute = (agent, kind, spec) => {
+    const service = (agent.ctx && agent.ctx.systemPrompt) || null
+    if (!service) return () => {}
+    if (typeof service[kind] === 'function') return service[kind](spec)
+    if (kind === 'context' && typeof service.section === 'function') return service.section(spec)
+    return () => {}
+  }
+
   const attach = (agent) => {
     if (stopping || !agent || entries.has(agent)) return
     if (!agent.ctx || typeof agent.ctx.effect !== 'function') {
@@ -389,66 +410,62 @@ export function apply(ctx, config = {}) {
         logger.info?.(t('log.newSessionMuted', { session: sessionId }))
       }
       const cleanup = agent.ctx.effect(() => {
-        const section = agent.ctx.systemPrompt && typeof agent.ctx.systemPrompt.section === 'function'
-          ? agent.ctx.systemPrompt.section({
-              name: 'project-karen-sleep',
-              order: 60,
-              text: () => {
-                try {
-                  const cfg = store.config
-                  if (!cfg.enabled) return ''
-                  const view = timeline.snapshot(sessionId, cfg, now())
-                  if (!view || view.skipped) return ''
-                  return view.phase === 'asleep' ? sleepPrompt(view, cfg, now()) : ''
-                } catch { return '' }
-              },
-            })
-          : () => {}
-        const actionSection = agent.ctx.systemPrompt && typeof agent.ctx.systemPrompt.section === 'function'
-          ? agent.ctx.systemPrompt.section({
-              name: 'project-karen-action',
-              order: 61,
-              text: () => {
-                try {
-                  const cfg = store.config
-                  if (!cfg.enabled) return ''
-                  const view = timeline.snapshot(sessionId, cfg, now())
-                  if (!view || view.skipped) return ''
-                  if (view.phase !== 'awake') return ''
-                  return actionSectionText(view, now())
-                } catch { return '' }
-              },
-            })
-          : () => {}
+        // 顺序落在框架自己的三条运行时上下文（沙箱策略 110 / 审批策略 115 / 子代理委派 120）之后。
+        const sleepInjection = contribute(agent, 'context', {
+          name: 'project-karen-sleep',
+          order: 131,
+          text: () => {
+            try {
+              const cfg = store.config
+              if (!cfg.enabled) return ''
+              const view = timeline.snapshot(sessionId, cfg, now())
+              if (!view || view.skipped) return ''
+              return view.phase === 'asleep' ? sleepPrompt(view, cfg, now()) : ''
+            } catch { return '' }
+          },
+        })
+        const actionInjection = contribute(agent, 'context', {
+          name: 'project-karen-action',
+          order: 132,
+          text: () => {
+            try {
+              const cfg = store.config
+              if (!cfg.enabled) return ''
+              const view = timeline.snapshot(sessionId, cfg, now())
+              if (!view || view.skipped) return ''
+              if (view.phase !== 'awake') return ''
+              return actionSectionText(view, now())
+            } catch { return '' }
+          },
+        })
         // 今天的情况：天气 + 节日 + 生日。三者都可开关，全空时不注入。
-        const contextSection = agent.ctx.systemPrompt && typeof agent.ctx.systemPrompt.section === 'function'
-          ? agent.ctx.systemPrompt.section({
-              name: 'project-karen-context',
-              order: 59,
-              text: () => {
-                try {
-                  const cfg = store.config
-                  if (!cfg.enabled) return ''
-                  if (timeline.isSkipped(sessionId)) return ''
-                  return contextSectionText(cfg, now())
-                } catch { return '' }
-              },
-            })
-          : () => {}
-        const cameraSection = agent.ctx.systemPrompt && typeof agent.ctx.systemPrompt.section === 'function'
-          ? agent.ctx.systemPrompt.section({
-              name: 'project-karen-camera',
-              order: 62,
-              text: () => {
-                try {
-                  const cfg = store.config
-                  if (!cfg.enabled || cfg.apiKey) return ''
-                  if (timeline.isSkipped(sessionId)) return ''
-                  return cameraPrompt()
-                } catch { return '' }
-              },
-            })
-          : () => {}
+        // 频率比分钟低，但天气每小时会刷一次、节日跨天会变 —— 留在分节里照样让整条前缀
+        // 每小时失效一次，所以同样是「会变的事实」，一样走上下文。
+        const todayInjection = contribute(agent, 'context', {
+          name: 'project-karen-context',
+          order: 130,
+          text: () => {
+            try {
+              const cfg = store.config
+              if (!cfg.enabled) return ''
+              if (timeline.isSkipped(sessionId)) return ''
+              return contextSectionText(cfg, now())
+            } catch { return '' }
+          },
+        })
+        // 相机那条跟当前状态无关，只在配置变化时才变 —— 唯一该留在系统提示词里的。
+        const cameraInjection = contribute(agent, 'section', {
+          name: 'project-karen-camera',
+          order: 62,
+          text: () => {
+            try {
+              const cfg = store.config
+              if (!cfg.enabled || cfg.apiKey) return ''
+              if (timeline.isSkipped(sessionId)) return ''
+              return cameraPrompt()
+            } catch { return '' }
+          },
+        })
         const offEvent = typeof agent.ctx.on === 'function'
           ? agent.ctx.on('session/event', (session, event) => {
               try {
@@ -469,10 +486,10 @@ export function apply(ctx, config = {}) {
         return () => {
           try { clearInterval(timer) } catch {}
           try { offEvent() } catch {}
-          try { section() } catch {}
-          try { actionSection() } catch {}
-          try { contextSection() } catch {}
-          try { cameraSection() } catch {}
+          try { sleepInjection() } catch {}
+          try { actionInjection() } catch {}
+          try { todayInjection() } catch {}
+          try { cameraInjection() } catch {}
         }
       }, 'project-karen.runtime()')
       entries.set(agent, { sessionId, cleanup })
@@ -492,16 +509,27 @@ export function apply(ctx, config = {}) {
             attach(agent)
           })
         : () => {}
+      // 销号：宿主销毁 agent 时会喊一声 agent/disposed（dsh-agent 的 emitDisposed，
+      // 走的是和 agent/created 同一条 carrier 通道）。不接这声喊，entries 里就永远留着
+      // 它 —— 面板的「活跃会话」只增不减，调试按钮也会对着这些空号下手。
+      // timer 与提示词注入挂在 agent 自己的 effect 上，随它的作用域一起被回收，
+      // 所以这里只需要把登记的那一行划掉。
+      const offDisposed = typeof ctx.on === 'function'
+        ? ctx.on('agent/disposed', ({ agent }) => {
+            try { entries.delete(agent) } catch { /* 单条销号出错不影响其它 */ }
+          })
+        : () => {}
       try {
         for (const agent of (ctx.agents && typeof ctx.agents.roots === 'function' ? ctx.agents.roots() : []) || []) attach(agent)
       } catch { /* roots() 不可用 */ }
-      // 天气定时刷新：与有没有活跃会话无关。refreshWeather 内部还有 30 分钟 TTL。
+      // 天气定时刷新：与有没有活跃会话无关。refreshWeather 内部还有 60 分钟 TTL。
       refreshWeather(false)
       const weatherTimer = setInterval(() => { refreshWeather(false) }, 10 * 60 * 1000)
       return async () => {
         stopping = true
         try { clearInterval(weatherTimer) } catch {}
         try { offCreated() } catch {}
+        try { offDisposed() } catch {}
         const cleanups = [...entries.values()].map((item) => item.cleanup)
         entries.clear()
         await Promise.allSettled(cleanups.map((cleanup) => Promise.resolve().then(() => cleanup())))

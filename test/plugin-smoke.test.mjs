@@ -38,7 +38,9 @@ check('六个路由注册齐（status/locale/config/debug/clear + prefix raw）'
 check('两个工具注册齐', night.tools.has('karen_photo') && night.tools.has('karen_action'),
   [...night.tools.keys()].join(', '))
 check('/mute 命令注册了', night.commands.has('mute'))
-check('四个系统提示词分节注册齐', night.sections.size === 4, [...night.sections.keys()].join(', '))
+check('系统提示词分节只剩相机那条（静态能力说明）', night.sections.size === 1 && night.sections.has('project-karen-camera'),
+  [...night.sections.keys()].join(', '))
+check('睡眠/动作/今天三块注册成运行时上下文', night.contexts.size === 3, [...night.contexts.keys()].join(', '))
 check('没有告警（注册过程干净）', night.warnings.length === 0, night.warnings.join(' | '))
 
 console.log('\n2. 心跳：假定时器接管了 tick')
@@ -73,14 +75,14 @@ try { await startKaren({ startAt: NOON, config: FIXED }) } catch (error) { refus
 check('并发启动被拒绝（假时钟无法共存）', refused.length > 0, refused || '居然没报错')
 solo.stop()
 
-console.log('\n7. 注入分节：睡着与醒着注入的东西不一样')
+console.log('\n7. 注入：睡着与醒着注入的东西不一样')
 await withKaren({ startAt: NIGHT, config: FIXED }, async (karen) => {
-  check('深夜：睡眠分节有内容', karen.promptOf('project-karen-sleep').length > 0)
-  check('深夜：动作分节为空', karen.promptOf('project-karen-action') === '',
+  check('深夜：睡眠注入有内容', karen.promptOf('project-karen-sleep').length > 0)
+  check('深夜：动作注入为空', karen.promptOf('project-karen-action') === '',
     karen.promptOf('project-karen-action').slice(0, 60))
 })
 await withKaren({ startAt: NOON, config: FIXED }, async (karen) => {
-  check('中午：睡眠分节为空', karen.promptOf('project-karen-sleep') === '',
+  check('中午：睡眠注入为空', karen.promptOf('project-karen-sleep') === '',
     karen.promptOf('project-karen-sleep').slice(0, 60))
 })
 await withKaren({ startAt: NIGHT, config: { ...FIXED, enabled: false } }, async (karen) => {
@@ -133,6 +135,15 @@ await withKaren({ startAt: NOON, config: {} }, async (karen) => {
       }
     }
   }
+})
+
+console.log('\n10. 销号：agent 被销毁后，面板的花名册里不能再留着它')
+await withKaren({ startAt: NOON, config: FIXED }, async (karen) => {
+  check('销毁前在册', (await karen.status()).agents.length === 1)
+  // 先确认这声喊真的有人接：0 的话下面那条就是空断言（假绿）。
+  check('宿主喊 agent/disposed 时有人接', karen.emit('agent/disposed', { agent: karen.agent }) === 1)
+  const left = (await karen.status()).agents
+  check('销毁后不在册（此前它会一直挂在面板上）', left.length === 0, JSON.stringify(left))
 })
 
 if (failures.length > 0) {

@@ -28,7 +28,7 @@
 从 GitHub：
 
 ```powershell
-dsh plugin --profile <profile> add "git+https://github.com/2huy4n/ProjectKaren#v0.2.2"
+dsh plugin --profile <profile> add "git+https://github.com/2huy4n/ProjectKaren#v0.2.3"
 ```
 
 安装后需要重启 DSH，在「设置 → ProjectKaren」里配置。
@@ -79,7 +79,7 @@ dsh plugin --profile <profile> add "git+https://github.com/2huy4n/ProjectKaren#v
 天气数据来自 [Open-Meteo.com](https://open-meteo.com/)（[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)），
 免 API Key、无需注册。
 
-- **两个城市相同**（或只填了一个）：TA按「TA和你在同一个地方」来说天气。
+- **两个城市相同**（或只填了角色城市）：TA按「TA和你在同一个地方」来说天气。
 - **两个城市不同**：TA会知道你不在TA那边，可以顺口提一句你那边的天气（比如提醒你带伞）。
 
 天气每小时最多刷新一次，面板里有「立即刷新天气」。取不到天气时TA**不会编造**。
