@@ -330,6 +330,19 @@ export class SessionTimeline {
     return true
   }
 
+  recoverOverdueLife(sessionId, at) {
+    const record = this.#of(sessionId)
+    if (!record || record.skipped || !record.life) return false
+    const life = record.life
+    const activity = life.activities.find(a => a.status === 'in_progress' && Number.isFinite(a.endAt) && a.endAt <= at)
+    if (!activity) return false
+    transition(life, activity.id, 'postponed', at, { reason: 'Unconfirmed after scheduler restart' })
+    life.needsReplan = true
+    life.revision = (life.revision || 0) + 1
+    this.persist()
+    return true
+  }
+
   advanceLife(sessionId, cfg, at) {
     const record = this.#of(sessionId)
     if (!record || record.skipped) return

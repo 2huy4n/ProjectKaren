@@ -589,6 +589,7 @@ export function apply(ctx, config = {}) {
       }, 'project-karen.runtime()')
       entries.set(agent, { sessionId, cleanup })
       timeline.snapshot(sessionId, store.config, now())
+      timeline.recoverOverdueLife(sessionId, now())
     } catch (error) {
       logger.warn?.(t('err.attach.failed', { msg: String(error?.message || error) }))
     }
