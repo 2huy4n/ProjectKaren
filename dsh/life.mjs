@@ -118,11 +118,14 @@ export function selectConversation(events) {
 export class LifePlanner {
   constructor({ read, save, generate, now = Date.now, retryMs = 300000 }) {
     this.read = read; this.save = save; this.generate = generate; this.now = now
-    this.retryMs = retryMs; this.busy = new Set(); this.retry = new Map()
+    this.retryMs = retryMs; this.busy = new Set(); this.retry = new Map(); this.retryEpoch = 0
   }
+  resetRetries() { this.retry.clear(); this.retryEpoch++ }
   async tick(id, config, events = []) {
     const at = this.now(), state = this.read(id, at)
-    if (!state || state.skipped || state.phase !== 'awake' || this.busy.has(id) || at < (this.retry.get(id) || 0)) return false
+    const retry = this.retry.get(id)
+    const limit = Number.isInteger(config.planningRetryLimit) ? config.planningRetryLimit : 5
+    if (!state || state.skipped || state.phase !== 'awake' || this.busy.has(id) || (retry && (retry.failures > limit || at < retry.at))) return false
     const life = state.life
     const active = life.activities.find(a => a.status === 'in_progress')
     if (active && at < active.endAt) return false
@@ -131,16 +134,17 @@ export class LifePlanner {
     const end = Math.min(at + config.planningHorizonMinutes * 60000, Number.isFinite(boundary) && boundary > at ? boundary : Infinity)
     if (end <= at + 60000) return false
     const revision = state.revision
+    const retryEpoch = this.retryEpoch
     this.busy.add(id)
     try {
       const result = await this.generate({ sessionId: id, now: at, windowEnd: end, life: planningContext(life, at), ...selectConversation(events) })
       const latest = this.read(id, this.now())
       if (!latest || latest.phase !== 'awake' || latest.skipped || latest.planningEnabled === false || latest.actionEnabled === false || latest.planningHorizonMinutes !== state.planningHorizonMinutes || latest.life.id !== life.id || latest.revision !== revision || latest.sleepAtMs !== state.sleepAtMs || latest.awakeUntilMs !== state.awakeUntilMs || this.now() >= end) return false
       this.save(id, result, { now: at, windowEnd: end, sleepAt: boundary, revision })
-      this.retry.delete(id)
+      if (this.retryEpoch === retryEpoch) this.retry.delete(id)
       return true
     } catch (error) {
-      this.retry.set(id, this.now() + this.retryMs)
+      if (this.retryEpoch === retryEpoch) this.retry.set(id, { at: this.now() + this.retryMs, failures: (retry?.failures || 0) + 1 })
       throw error
     } finally { this.busy.delete(id) }
   }

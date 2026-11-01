@@ -45,7 +45,11 @@ separate `llm.stream` request, tagged as Karen-originated for existing middlewar
 it does not inject a follow-up into the conversation or directly send messages.
 The host's normal usage gate must account for it. Model output is validated before
 commit, and concurrent or stale responses cannot replace newer state. Failures
-retry after five minutes. Offline tests exercise DSH prompt assembly and middleware;
+retry at five-minute intervals, subject to `planningRetryLimit` (default 5 retries
+after the initial attempt, range 0–100; 0 disables retries). After exhaustion,
+planning stops retrying for that session and logs a warning. Re-enable planning,
+change the retry limit, or restart the process to reset the in-memory counters.
+Existing activity state is retained. Offline tests exercise DSH prompt assembly and middleware;
 a small isolated live review also used synthetic session data and a separate
 budget. Each deployment should verify its own prompt assembly, accounting, message
 routing and delivery integration before rollout.

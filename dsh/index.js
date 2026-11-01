@@ -413,7 +413,10 @@ export function apply(ctx, config = {}) {
     if (canPlan || timeline.hasLife(sessionId)) timeline.advanceLife(sessionId, cfg, at)
     if (canPlan) {
       const events = typeof agent.session?.snapshotEvents === 'function' ? agent.session.snapshotEvents() : []
-      void planner.tick(sessionId, cfg, events).catch(error => logger.warn?.('project-karen: life planning deferred: ' + String(error?.message || error)))
+      void planner.tick(sessionId, cfg, events).catch(error => {
+        const exhausted = planner.retry.get(sessionId)?.failures > cfg.planningRetryLimit
+        logger.warn?.('project-karen: life planning ' + (exhausted ? 'retry limit reached' : 'deferred') + ': ' + String(error?.message || error))
+      })
     }
     const plan = timeline.due(sessionId, cfg, at)
     for (const intent of plan.intents) {
@@ -988,7 +991,9 @@ export function apply(ctx, config = {}) {
           // 否则用户在面板里改任何别的设置再点保存，真实 Key 就会被这个掩码覆盖掉。
           if (incoming.apiKey === '' || incoming.apiKey === undefined || isMaskedApiKey(incoming.apiKey)) delete incoming.apiKey
           const wasPlanningEnabled = store.config.planningEnabled
+          const previousRetryLimit = store.config.planningRetryLimit
           const value = store.setConfig(incoming)
+          if ((!wasPlanningEnabled && value.planningEnabled) || value.planningRetryLimit !== previousRetryLimit) planner.resetRetries()
           if (value.planningEnabled !== wasPlanningEnabled) {
             const at = now()
             for (const sessionId of Object.keys(store.state)) {

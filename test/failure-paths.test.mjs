@@ -4,7 +4,43 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { LifePlanner, lifeOf } from '../dsh/life.mjs'
 import { SessionTimeline } from '../dsh/session.mjs'
-import { Store, defaultConfig } from '../dsh/store.js'
+import { Store, defaultConfig, normalizeConfig } from '../dsh/store.js'
+
+assert.equal(defaultConfig().planningRetryLimit, 5)
+assert.equal(normalizeConfig({planningRetryLimit:2}).planningRetryLimit, 2)
+assert.equal(normalizeConfig({planningRetryLimit:0}).planningRetryLimit, 0)
+assert.equal(normalizeConfig({planningRetryLimit:999}).planningRetryLimit, 100)
+
+// Five retries are in addition to the initial attempt, each at least five
+// minutes apart. Exhaustion is session-local and reset permits recovery.
+let limitClock=1000000, limitCalls=0, fail=true
+const limitState={life:lifeOf({}),revision:0,phase:'awake',sleepAtMs:limitClock+86400000}
+const limited=new LifePlanner({now:()=>limitClock,read:()=>limitState,save:()=>{},generate:async()=>{limitCalls++;if(fail)throw Error('offline');return {activities:[]}}})
+const limitConfig={planningHorizonMinutes:180,planningRetryLimit:5}
+for(let attempt=0;attempt<6;attempt++) {
+ await assert.rejects(limited.tick('limit',limitConfig),/offline/)
+ if(attempt<5) {
+  limitClock+=299999;assert.equal(await limited.tick('limit',limitConfig),false)
+  limitClock++
+ }
+}
+limitClock+=3600000
+assert.equal(await limited.tick('limit',limitConfig),false);assert.equal(limitCalls,6)
+fail=false;limited.resetRetries()
+assert.equal(await limited.tick('limit',limitConfig),true);assert.equal(limited.retry.has('limit'),false)
+
+let zeroCalls=0
+const zeroPlanner=new LifePlanner({now:()=>limitClock,read:()=>limitState,save:()=>{},generate:async()=>{zeroCalls++;throw Error('offline')}})
+await assert.rejects(zeroPlanner.tick('zero',{...limitConfig,planningRetryLimit:0}),/offline/)
+limitClock+=300000;assert.equal(await zeroPlanner.tick('zero',{...limitConfig,planningRetryLimit:0}),false);assert.equal(zeroCalls,1)
+
+// An in-flight failure from before an administrative reset cannot exhaust the
+// new retry budget.
+let rejectOld
+const pendingPlanner=new LifePlanner({now:()=>limitClock,read:()=>limitState,save:()=>{},generate:()=>new Promise((_,reject)=>{rejectOld=reject})})
+const pending=pendingPlanner.tick('pending',limitConfig)
+pendingPlanner.resetRetries();rejectOld(Error('old failure'))
+await assert.rejects(pending,/old failure/);assert.equal(pendingPlanner.retry.has('pending'),false)
 
 // Failure schedules one retry after five minutes; no early call is admitted.
 let clock=1000000, calls=0, saves=0
@@ -69,5 +105,21 @@ try {
  assert.equal(activity.status,'interrupted')
  assert.equal(activity.endedAt,k.now()+60*60000)
 } finally {k.stop()}
+
+// Settings changes reset an exhausted budget through the real config route.
+let routeCalls=0
+const offline={async *stream(){routeCalls++;throw Error('route offline')}}
+const routeKaren=await startKaren({startAt:start,config:{planningRetryLimit:0,sleepJitter:0,wakeJitter:0,weatherEnabled:false,greetEnabled:false,talkEnabled:false},llm:offline})
+try {
+ await routeKaren.tickAndSettle();await routeKaren.tickAndSettle()
+ assert.equal(routeCalls,1)
+ await routeKaren.request('POST','/project-karen/config',{config:{planningRetryLimit:1}})
+ await routeKaren.tickAndSettle();assert.equal(routeCalls,2)
+ routeKaren.advance(300000);await routeKaren.tickAndSettle();assert.equal(routeCalls,3)
+ routeKaren.advance(300000);await routeKaren.tickAndSettle();assert.equal(routeCalls,3)
+ await routeKaren.request('POST','/project-karen/config',{config:{planningEnabled:false}})
+ await routeKaren.request('POST','/project-karen/config',{config:{planningEnabled:true}})
+ await routeKaren.tickAndSettle();assert.equal(routeCalls,4)
+} finally {routeKaren.stop()}
 
 console.log('failure, retry and clock paths: ok')
