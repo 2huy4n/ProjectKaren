@@ -88,5 +88,5 @@ Completed, cancelled, skipped and interrupted history remains capped separately.
 Unresolved anchors are retained independently of this activity capacity.
 
 `npm ci` installs the pinned DSH test dependencies. `npm test` runs both the DSH
-integration test and unit tests. CI uses the same commands. Tests require no
+integration test and unit tests. Tests require no
 provider credentials, Telegram connection, or production state.
