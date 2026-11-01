@@ -526,7 +526,8 @@ export function apply(ctx, config = {}) {
             const view = timeline.lifeSnapshot(sessionId, store.config, now())
             if (!view || view.skipped) return ''
             const { current, ...context } = planningContext(view.life, now())
-            return 'FICTIONAL LIFE RECORD — plans are not completed events; conversation is not evidence of action.\n' + JSON.stringify(context)
+            const currentActivityId = view.phase === 'awake' ? current[0]?.id : undefined
+            return 'FICTIONAL LIFE RECORD — plans are not completed events; conversation is not evidence of action. Confirm a current activity using karen_action only when completion is established; elapsed time alone is not confirmation.\n' + JSON.stringify({ currentActivityId, ...context })
           },
         }) : () => {}
         // 今天的情况：天气 + 节日 + 生日。三者都可开关，全空时不注入。
@@ -722,6 +723,8 @@ export function apply(ctx, config = {}) {
             label: { type: 'string', description: t('tool.action.labelParam') },
             minutes: { type: 'integer', description: t('tool.action.minutesParam') },
             motive: { type: 'string', description: t('tool.action.motiveParam') },
+            completeActivityId: { type: 'string', description: t('tool.action.completeParam') },
+            consequences: { type: 'array', maxItems: 5, items: { type: 'string', maxLength: 240 }, description: t('tool.action.consequencesParam') },
           },
           required: ['label'],
           additionalProperties: false,
@@ -737,7 +740,7 @@ export function apply(ctx, config = {}) {
             required: ['label', 'minutes', 'endsAt'],
             additionalProperties: false,
           },
-          render: (_args, value) => [{ type: 'text', text: t('tool.action.render', { label: value.label, minutes: value.minutes }) }],
+          render: (args, value) => [{ type: 'text', text: args?.completeActivityId ? t('tool.action.completedRender', { label: value.label }) : t('tool.action.render', { label: value.label, minutes: value.minutes }) }],
         },
         isConcurrencySafe: () => false,
         execute(args, exec) {
@@ -751,11 +754,17 @@ export function apply(ctx, config = {}) {
           const raw = Number.isFinite(asked) ? asked : cfg.actionDefaultMinutes
           const minutes = Math.min(cfg.actionMaxMinutes, Math.max(cfg.actionMinMinutes, raw))
           const at = now()
+          if (args?.completeActivityId !== undefined) {
+            const completed = timeline.completeAction(sessionId, String(args.completeActivityId), label, args.consequences ?? [], exec?.callId, at, cfg)
+            store.pushLog({ kind: 'action-confirmed', sessionId, label })
+            return { label: completed.label, minutes: completed.minutes ?? Math.round((completed.endAt - completed.startAt) / 60000), endsAt: completed.endsAt }
+          }
+          if (args?.consequences !== undefined) throw Error('consequences require an activity confirmation')
           const started = timeline.startAction(sessionId, {
             label,
             motive: String((args && args.motive) || '').trim(),
             minutes,
-          }, at)
+          }, at, cfg)
           store.pushLog({ kind: 'action-start', sessionId, label })
           store.persist()
           logger.info?.(t('log.actionStart', { session: sessionId, label }))

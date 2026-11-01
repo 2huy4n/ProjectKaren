@@ -9,7 +9,7 @@ record.life = JSON.parse(JSON.stringify(life))
 life = lifeOf(record)
 assert.equal(life.activities[0].status, 'in_progress')
 const id = life.activities[0].id
-assert.equal(transition(life, id, 'completed', 30, { consequences: ['Owns a novel'] }), true)
+assert.equal(transition(life, id, 'completed', 30, { consequences: ['Owns a novel'], confirmation: {kind:'karen_action',activityId:id,callId:'test-call'} }), true)
 assert.equal(transition(life, id, 'completed', 30), false)
 assert.equal(planningContext(life, 30).recent[0].label, 'Read')
 assert.equal(planningContext(life, 30).facts[0].text, 'Owns a novel')

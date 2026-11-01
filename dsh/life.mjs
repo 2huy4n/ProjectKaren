@@ -36,7 +36,10 @@ export function planningContext(life, now, { historyLimit = 12 } = {}) {
     current: life.activities.filter(a => a.status === 'in_progress'),
     future: life.activities.filter(a => a.status === 'planned'),
     recent: life.activities.filter(a => FINAL.has(a.status)).slice(-historyLimit),
-    anchors: life.anchors.filter(a => a.status !== 'cancelled' && (!a.endAt || a.endAt > now)),
+    anchors: [
+      ...life.anchors.filter(a => !['cancelled', 'completed'].includes(a.status) && a.endAt > now).sort((a, b) => a.startAt - b.startAt).slice(0, 25),
+      ...life.anchors.filter(a => !['cancelled', 'completed'].includes(a.status) && a.endAt <= now).sort((a, b) => b.endAt - a.endAt).slice(0, 5),
+    ],
     facts: life.facts.slice(-30),
   }
 }
@@ -59,17 +62,18 @@ export function addPlan(life, proposals, { now, windowEnd, sleepAt } = {}) {
   return staged
 }
 
-export function transition(life, id, status, at, { reason = '', consequences = [] } = {}) {
+export function transition(life, id, status, at, { reason = '', consequences = [], confirmation } = {}) {
   const a = life.activities.find(x => x.id === id)
   if (!a || !Number.isFinite(at)) throw new Error('unknown activity or invalid time')
   if (a.status === status) return false
+  if (status === 'completed' && (!confirmation || confirmation.kind !== 'karen_action' || confirmation.activityId !== id || typeof confirmation.callId !== 'string' || !confirmation.callId)) throw new Error('explicit activity confirmation required')
   const allowed = a.status === 'planned' ? ['in_progress', 'cancelled', 'skipped', 'postponed'] : a.status === 'in_progress' ? ['completed', 'cancelled', 'interrupted', 'postponed'] : []
   if (!allowed.includes(status)) throw new Error('invalid activity transition')
   if (status === 'in_progress' && life.activities.some(x => x.id !== id && x.status === 'in_progress')) throw new Error('another activity is in progress')
   a.status = status
   a.updatedAt = at
   if (status === 'in_progress') a.startedAt = at
-  else { a.endedAt = at; a.reason = clean(reason) }
+  else { a.endedAt = at; a.reason = clean(reason); if (status === 'completed') a.confirmation = { ...confirmation, at } }
   if (status === 'completed' && Array.isArray(consequences)) {
     for (const value of consequences) {
       const text = clean(value)

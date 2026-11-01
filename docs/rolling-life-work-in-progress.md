@@ -4,8 +4,11 @@ Karen's 20-second session heartbeat owns the rolling planner. When enabled, it
 migrates the legacy current action into the per-session `life` record in the
 existing `project-karen.json` file. It retains activities and their explicit
 states, recent history, future activities, daily anchors, and a bounded set of
-persistent consequences. Planned end times alone do not complete an activity:
-the planner must explicitly resolve or extend it. Missed activities are postponed
+persistent consequences. Planned end times and planning responses cannot complete
+an activity. Completion requires a separate identified `karen_action` tool call
+with `completeActivityId`; optional `consequences` record up to five durable facts.
+The label and identifier must match an in-progress activity. Repeated confirmation
+is idempotent. Missed activities are postponed
 and sleep interrupts ongoing work conservatively. The existing Karen sleep and
 barrage-wake calculations determine when planning can run and its boundary.
 
@@ -42,14 +45,12 @@ separate `llm.stream` request, tagged as Karen-originated for existing middlewar
 it does not inject a follow-up into the conversation or directly send messages.
 The host's normal usage gate must account for it. Model output is validated before
 commit, and concurrent or stale responses cannot replace newer state. Failures
-retry after five minutes. Planning output and model behavior have only been tested
-with offline mocks, not a paid model or production conversation. An additional
-offline test exercises the installed DSH system-prompt and LLM middleware services
-with a synthetic character section. Each deployment should verify its own prompt assembly, accounting, message
-routing and delivery integration in isolation before rollout. These tests use no
-production files, provider calls or quota.
+retry after five minutes. Offline tests exercise DSH prompt assembly and middleware;
+a small isolated live review also used synthetic session data and a separate
+budget. Each deployment should verify its own prompt assembly, accounting, message
+routing and delivery integration before rollout.
 
-The planner's significant consequences are limited to explicit resolutions;
+The planner's significant consequences are limited to explicit confirmations;
 conversation is provided as context and is not automatically converted into
 world state. Anchor and fact selection remain model-dependent. There is no
 semantic guarantee that a model's chosen description is true; invalid timing,
@@ -59,6 +60,12 @@ conflicts, missing resolution reasons and stale results are rejected.
 
 The rolling planner and pause/resume behavior have offline coverage. The installed
 DSH service check uses synthetic middleware; it does not exercise every deployment's
-prompt, accounting, batching, or delivery components. Model behavior has not been
-evaluated with live requests. Deployments should assess their integration and
-rollback procedures separately before enabling this feature.
+prompt, accounting, batching, or delivery components. A small isolated live review exercised planning and sleep/wake; it did not test
+every integration or extended behavior. Deployments should assess their integration
+and rollback procedures separately before enabling this feature.
+
+Unresolved anchors are retained even after their planned end, until explicitly
+cancelled or matched to a confirmed completed activity. Planning context selects a
+bounded set of upcoming and overdue anchors; the full set remains in persistent
+state and conflict checks. Hosts that rewrite tool schemas must preserve the
+`completeActivityId` and `consequences` properties on `karen_action`.

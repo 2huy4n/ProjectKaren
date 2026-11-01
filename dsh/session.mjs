@@ -220,7 +220,7 @@ export class SessionTimeline {
     const life = structuredClone(record.life)
     const current = life.activities.find(a => a.status === 'in_progress')
     if (current) {
-      if (!result?.resolution || result.resolution.id !== current.id || !['continue', 'completed', 'interrupted', 'postponed', 'cancelled'].includes(result.resolution.status)) throw Error('current activity needs explicit resolution')
+      if (!result?.resolution || result.resolution.id !== current.id || !['continue', 'interrupted', 'postponed', 'cancelled'].includes(result.resolution.status)) throw Error('current activity needs explicit resolution')
       if (typeof result.resolution.reason !== 'string' || !result.resolution.reason.trim()) throw Error('activity resolution requires a reason')
       if (result.resolution.status === 'continue') {
         const end = Number(result.resolution.endAt)
@@ -239,26 +239,30 @@ export class SessionTimeline {
     if (result?.anchorChanges !== undefined && (!Array.isArray(result.anchorChanges) || result.anchorChanges.length > 6)) throw Error('invalid anchor changes')
     for (const change of result.anchorChanges || []) {
       const anchor = life.anchors.find(a => a.id === change.id)
-      if (!anchor || anchor.status === 'cancelled' || change.status !== 'cancelled' || typeof change.reason !== 'string' || !change.reason.trim()) throw Error('invalid anchor change')
+      if (!anchor || ['cancelled', 'completed'].includes(anchor.status) || change.status !== 'cancelled' || typeof change.reason !== 'string' || !change.reason.trim()) throw Error('invalid anchor change')
       anchor.status = 'cancelled'; anchor.cancelledAt = now; anchor.reason = change.reason.trim().slice(0, 240)
     }
-    // Anchors are established once per day and never overwritten by a later plan.
+    // Keep established anchors; allow later plans to add new commitments.
     const today = dayKeyOf(now)
-    if (life.anchorDay !== today && Array.isArray(result.anchors)) {
+    if (Array.isArray(result.anchors)) {
       for (const a of result.anchors.slice(0, 6)) {
         const label = typeof a.label === 'string' ? a.label.trim().slice(0, 200) : ''
         const startAt = Number(a.startAt), endAt = Number(a.endAt)
         if (!label || !Number.isFinite(startAt) || !Number.isFinite(endAt) || endAt <= startAt) throw Error('invalid anchor')
         const same = x => x.label.trim().toLowerCase() === label.toLowerCase()
-        if (life.anchors.some(x => x.status !== 'cancelled' && x.startAt === startAt && x.endAt === endAt && same(x))) continue
-        if (life.anchors.some(x => x.status !== 'cancelled' && x.startAt < endAt && startAt < x.endAt && !same(x)) || life.activities.some(x => ['planned', 'in_progress'].includes(x.status) && x.startAt < endAt && startAt < x.endAt && !same(x))) throw Error('anchor conflicts with commitment')
+        if (life.anchors.some(x => !['cancelled', 'completed'].includes(x.status) && x.startAt === startAt && x.endAt === endAt && same(x))) continue
+        if (life.anchors.some(x => !['cancelled', 'completed'].includes(x.status) && x.startAt < endAt && startAt < x.endAt && same(x))) throw Error('anchor change requires explicit resolution')
+        if (life.anchors.some(x => !['cancelled', 'completed'].includes(x.status) && x.startAt < endAt && startAt < x.endAt && !same(x)) || life.activities.some(x => ['planned', 'in_progress'].includes(x.status) && x.startAt < endAt && startAt < x.endAt && !same(x))) throw Error('anchor conflicts with commitment')
         life.anchors.push({ id: randomUUID(), label, startAt, endAt })
       }
       life.anchorDay = today
     }
-    life.anchors = life.anchors.filter(a => a.endAt > now).slice(-30)
+    // Never discard unresolved commitments, including overdue appointments.
+    const finishedAnchors = life.anchors.filter(a => ['cancelled', 'completed'].includes(a.status))
+    const keptAnchors = new Set(finishedAnchors.slice(-100).map(a => a.id))
+    life.anchors = life.anchors.filter(a => !['cancelled', 'completed'].includes(a.status) || keptAnchors.has(a.id))
     for (const a of result.activities) {
-      if (life.anchors.some(anchor => anchor.status !== 'cancelled' && a.startAt < anchor.endAt && anchor.startAt < a.endAt && String(a.label).trim().toLowerCase() !== anchor.label.toLowerCase())) throw Error('activity conflicts with anchor')
+      if (life.anchors.some(anchor => !['cancelled', 'completed'].includes(anchor.status) && a.startAt < anchor.endAt && anchor.startAt < a.endAt && String(a.label).trim().toLowerCase() !== anchor.label.toLowerCase())) throw Error('activity conflicts with anchor')
       const recent = life.activities.filter(x => ['completed', 'interrupted', 'postponed'].includes(x.status)).slice(-5)
       if (recent.some(x => x.label.toLowerCase() === String(a.label).trim().toLowerCase()) && !(typeof a.repeatReason === 'string' && a.repeatReason.trim())) throw Error('repeated activity requires a reason')
     }
@@ -272,6 +276,33 @@ export class SessionTimeline {
     const previous = record.life
     record.life = life
     if (this.persist() === false) { record.life = previous; throw Error('could not persist plan') }
+  }
+
+  // Confirmation is a separate tool event, never a claim in a plan response.
+  completeAction(sessionId, activityId, label, consequences, callId, at, cfg) {
+    const record = this.#of(sessionId)
+    if (!record?.life || typeof callId !== 'string' || !callId) throw Error('activity confirmation requires an identified tool call')
+    this.#ensureNight(record, sessionId, cfg, at)
+    const previous = record.life
+    const life = structuredClone(previous)
+    const activity = life.activities.find(a => a.id === activityId)
+    if (!activity || activity.label !== label) throw Error('activity confirmation does not match the record')
+    if (activity.status === 'completed') return { ...activity, endsAt: activity.endAt }
+    if (phaseOf(record, at) !== 'awake') throw Error('cannot confirm an activity while asleep')
+    if (activity.status !== 'in_progress') throw Error('only an in-progress activity can be confirmed')
+    if (!Array.isArray(consequences) || consequences.length > 5 || consequences.some(x => typeof x !== 'string' || !x.trim() || x.length > 240)) throw Error('invalid consequences')
+    transition(life, activityId, 'completed', at, { consequences, reason: 'Explicit activity confirmation',
+      confirmation: { kind: 'karen_action', activityId, callId } })
+    for (const anchor of life.anchors) {
+      if (!['cancelled', 'completed'].includes(anchor.status) && anchor.label.trim().toLowerCase() === activity.label.trim().toLowerCase() && activity.startAt < anchor.endAt && anchor.startAt < activity.endAt) {
+        anchor.status = 'completed'; anchor.completedAt = at; anchor.activityId = activityId
+      }
+    }
+    life.needsReplan = true
+    life.revision = (life.revision || 0) + 1
+    record.life = life
+    if (this.persist() === false) { record.life = previous; throw Error('could not persist activity confirmation') }
+    return { ...life.activities.find(a => a.id === activityId), endsAt: activity.endAt }
   }
 
   // The switch pauses the rolling scheduler, not the fictional sleep clock.
@@ -407,9 +438,10 @@ export class SessionTimeline {
   }
 
   /** 某个工具/指令直接开一个动作（karen_action）。 */
-  startAction(sessionId, action, at) {
+  startAction(sessionId, action, at, cfg) {
     const record = this.#of(sessionId)
     if (!record) return null
+    if (cfg) this.#ensureNight(record, sessionId, cfg, at)
     if (record.life) {
       const life = record.life
       if (phaseOf(record, at) !== 'awake') throw Error('cannot start an activity while asleep')
