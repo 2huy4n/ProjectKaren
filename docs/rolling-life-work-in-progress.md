@@ -69,3 +69,20 @@ cancelled or matched to a confirmed completed activity. Planning context selects
 bounded set of upcoming and overdue anchors; the full set remains in persistent
 state and conflict checks. Hosts that rewrite tool schemas must preserve the
 `completeActivityId` and `consequences` properties on `karen_action`.
+
+## Unresolved activity capacity
+
+Planned, in-progress and postponed activities share a limit of 200 unresolved
+records per session. Adding activities that would exceed the limit is rejected;
+no unresolved activity or commitment is silently deleted. Existing stores above
+the limit are retained, but cannot add activities until explicitly reduced. The
+planner receives the remaining capacity and bounded older postponed records. It
+can resume a postponed activity by ID (preserving its ID and previous postponement),
+or explicitly cancel or skip one with a reason. These changes are validated
+against other activities, anchors, the planning window and sleep boundaries.
+Completed, cancelled, skipped and interrupted history remains capped separately.
+Unresolved anchors are retained independently of this activity capacity.
+
+`npm ci` installs the pinned DSH test dependencies. `npm test` runs both the DSH
+integration test and unit tests. CI uses the same commands. Tests require no
+provider credentials, Telegram connection, or production state.

@@ -1,8 +1,7 @@
-// Run in the installed companion image with /test mounted read-only and network off.
+// Uses the public DSH package entry points and a synthetic scoped agent.
 import assert from 'node:assert/strict'
 import { generateLifePlan } from '../dsh/planner.mjs'
-const root='/opt/companion/node_modules/@deepseek-ai/'
-const mod=async name=>import(root+name+'/lib/index.js')
+const mod=async name=>import('@deepseek-ai/'+name)
 const {Context}=await mod('cordis')
 const ctx=new Context()
 try {

@@ -233,8 +233,22 @@ export class SessionTimeline {
     if (result?.changes !== undefined && (!Array.isArray(result.changes) || result.changes.length > 12)) throw Error('invalid changes')
     for (const change of result.changes || []) {
       const target = life.activities.find(a => a.id === change.id)
-      if (!target || target.status !== 'planned' || !['cancelled', 'postponed', 'skipped'].includes(change.status) || typeof change.reason !== 'string' || !change.reason.trim()) throw Error('invalid planned activity change')
-      transition(life, target.id, change.status, now, { reason: change.reason })
+      if (!target || typeof change.reason !== 'string' || !change.reason.trim()) throw Error('invalid activity change')
+      if (target.status === 'postponed' && change.status === 'resume') {
+        const startAt = Number(change.startAt), endAt = Number(change.endAt)
+        if (!Number.isFinite(startAt) || !Number.isFinite(endAt) || startAt < now || startAt >= windowEnd || endAt <= startAt || endAt > windowEnd || (Number.isFinite(sleepAt) && endAt > sleepAt)) throw Error('invalid resumed activity interval')
+        if (life.activities.some(a => a.id !== target.id && ['planned', 'in_progress'].includes(a.status) && startAt < (a.status === 'in_progress' && a.endAt < now ? Infinity : a.endAt) && a.startAt < endAt)) throw Error('resumed activity conflict')
+        if (life.anchors.some(a => !['cancelled', 'completed'].includes(a.status) && startAt < a.endAt && a.startAt < endAt && target.label.trim().toLowerCase() !== a.label.trim().toLowerCase())) throw Error('resumed activity conflicts with anchor')
+        target.previousPostponement = { startAt: target.startAt, endAt: target.endAt, startedAt: target.startedAt, endedAt: target.endedAt, reason: target.reason }
+        target.startAt = startAt; target.endAt = endAt; target.status = 'planned'; target.updatedAt = now
+        target.resumeReason = change.reason.trim().slice(0, 240)
+        delete target.startedAt; delete target.endedAt; delete target.reason
+      } else {
+        const allowed = target.status === 'planned' ? ['cancelled', 'postponed', 'skipped'] : target.status === 'postponed' ? ['cancelled', 'skipped'] : []
+        if (!allowed.includes(change.status)) throw Error('invalid activity change')
+        if (target.status === 'postponed') target.previousPostponement = { startAt: target.startAt, endAt: target.endAt, startedAt: target.startedAt, endedAt: target.endedAt, reason: target.reason }
+        transition(life, target.id, change.status, now, { reason: change.reason })
+      }
     }
     if (result?.anchorChanges !== undefined && (!Array.isArray(result.anchorChanges) || result.anchorChanges.length > 6)) throw Error('invalid anchor changes')
     for (const change of result.anchorChanges || []) {
@@ -402,7 +416,8 @@ export class SessionTimeline {
   }
 
   /** 取出并清空当前动作（不投递）。没有动作时返回 null。 */
-  takeAction(sessionId, at = Date.now()) {
+  takeAction(sessionId, at) {
+    if (!Number.isFinite(at)) throw Error('activity time is required')
     const record = this.#of(sessionId)
     if (!record) return null
     if (record.life) {

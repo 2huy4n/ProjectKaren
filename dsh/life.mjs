@@ -4,6 +4,8 @@ import { randomUUID } from 'node:crypto'
 
 const FINAL = new Set(['completed', 'cancelled', 'skipped', 'interrupted', 'postponed'])
 const ACTIVE = new Set(['planned', 'in_progress'])
+export const MAX_UNRESOLVED_ACTIVITIES = 200
+export const unresolvedActivityCount = (life) => life.activities.filter(a => ACTIVE.has(a.status) || a.status === 'postponed').length
 const clean = (s, n = 240) => typeof s === 'string' ? s.trim().slice(0, n) : ''
 const overlap = (a, b) => a.startAt < b.endAt && b.startAt < a.endAt
 
@@ -32,10 +34,14 @@ export function migrateAction(record) {
 }
 
 export function planningContext(life, now, { historyLimit = 12 } = {}) {
+  const recent = life.activities.filter(a => FINAL.has(a.status)).slice(-historyLimit)
+  const recentIds = new Set(recent.map(a => a.id))
   return {
     current: life.activities.filter(a => a.status === 'in_progress'),
     future: life.activities.filter(a => a.status === 'planned'),
-    recent: life.activities.filter(a => FINAL.has(a.status)).slice(-historyLimit),
+    recent,
+    olderPostponed: life.activities.filter(a => a.status === 'postponed' && !recentIds.has(a.id)).slice(0, historyLimit),
+    availableActivitySlots: Math.max(0, MAX_UNRESOLVED_ACTIVITIES - unresolvedActivityCount(life)),
     anchors: [
       ...life.anchors.filter(a => !['cancelled', 'completed'].includes(a.status) && a.endAt > now).sort((a, b) => a.startAt - b.startAt).slice(0, 25),
       ...life.anchors.filter(a => !['cancelled', 'completed'].includes(a.status) && a.endAt <= now).sort((a, b) => b.endAt - a.endAt).slice(0, 5),
@@ -48,6 +54,7 @@ export function planningContext(life, now, { historyLimit = 12 } = {}) {
 // are never silently overwritten; the caller must explicitly transition conflicts.
 export function addPlan(life, proposals, { now, windowEnd, sleepAt } = {}) {
   if (!Array.isArray(proposals) || !Number.isFinite(now) || !Number.isFinite(windowEnd) || windowEnd <= now) throw new Error('invalid planning window')
+  if (proposals.length && unresolvedActivityCount(life) + proposals.length > MAX_UNRESOLVED_ACTIVITIES) throw new Error('unresolved activity capacity reached')
   const staged = []
   for (const p of proposals) {
     const label = clean(p.label)
@@ -67,7 +74,7 @@ export function transition(life, id, status, at, { reason = '', consequences = [
   if (!a || !Number.isFinite(at)) throw new Error('unknown activity or invalid time')
   if (a.status === status) return false
   if (status === 'completed' && (!confirmation || confirmation.kind !== 'karen_action' || confirmation.activityId !== id || typeof confirmation.callId !== 'string' || !confirmation.callId)) throw new Error('explicit activity confirmation required')
-  const allowed = a.status === 'planned' ? ['in_progress', 'cancelled', 'skipped', 'postponed'] : a.status === 'in_progress' ? ['completed', 'cancelled', 'interrupted', 'postponed'] : []
+  const allowed = a.status === 'planned' ? ['in_progress', 'cancelled', 'skipped', 'postponed'] : a.status === 'in_progress' ? ['completed', 'cancelled', 'interrupted', 'postponed'] : a.status === 'postponed' ? ['cancelled', 'skipped'] : []
   if (!allowed.includes(status)) throw new Error('invalid activity transition')
   if (status === 'in_progress' && life.activities.some(x => x.id !== id && x.status === 'in_progress')) throw new Error('another activity is in progress')
   a.status = status
