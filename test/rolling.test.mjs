@@ -12,6 +12,7 @@ const mock = { async *stream(options) {
   assert.equal(options.messages.at(-1).source.kind, 'plugin:project-karen')
   const input = JSON.parse(options.messages[0].content[0].text)
   assert.equal(input.windowEnd - input.now, 180 * 60000)
+  assert.ok(input.schedulerClock.now && input.schedulerClock.windowEnd && input.schedulerClock.timeZone)
   const activity = {label: 'Read a novel', startAt: input.now, endAt: input.now + 60 * 60000}
   yield {type:'text-delta', text:JSON.stringify({anchors:[],activities:input.life.current.length ? [] : [activity],resolution:input.life.current.length ? {id:input.life.current[0].id,status:'postponed',reason:'Needs more time'} : null})}
   yield {type:'finish',reason:{kind:'stop'}}

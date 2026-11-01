@@ -15,7 +15,9 @@ and panel. Rolling planning uses `actionEnabled` as its master activity switch.
 `planningHorizonMinutes` is the length of the future window considered by the
 rolling planner, not the interval between individual activities or a guarantee
 that a new plan is generated exactly at each window boundary. An ongoing activity,
-sleep, or an unavailable model can delay replanning.
+sleep, or an unavailable model can delay replanning. Planning context includes
+the scheduler's local time and time zone as well as epoch timestamps, so time of
+day is clear without inferring the character's location.
 
 `actionIntervalMinutes` is the legacy scheduler's wait between idle-action
 requests; `actionJitterMinutes` varies that wait. `actionIdleMinutes` and

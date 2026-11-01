@@ -63,7 +63,7 @@ dsh plugin --profile <profile> add "git+https://github.com/2huy4n/ProjectKaren#v
 `actionIntervalMinutes` 控制旧版空闲动作调度器两次请求之间的等待时间。
 会话开始使用滚动生活记录后，旧版的间隔、抖动、空闲阈值和每日动作上限不再决定该会话的活动。
 此时关闭 `planningEnabled` 会暂停生成新计划和开始已安排的活动，**不会恢复旧版调度器**；
-重新开启时，暂停期间错过的活动会被标记为延期。详见[滚动生活规划说明](docs/rolling-life-work-in-progress.md)。
+重新开启时，暂停期间错过的活动会被标记为延期。规划时使用调度器所在时区的本地时间。详见[滚动生活规划说明](docs/rolling-life-work-in-progress.md)。
 
 ## `/mute` 指令
 
