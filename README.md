@@ -47,6 +47,7 @@ dsh plugin --profile <profile> add "git+https://github.com/2huy4n/ProjectKaren#v
 | `barrageCount` / `barrageWindowMinutes` / `barrageAwakeMinutes` | 吵醒阈值 / 统计窗口 / 清醒时长 |
 | `talkEnabled` / `talkIntervalMinutes` / `talkJitterMinutes` / `talkDailyMax` | 主动搭话开关 / 间隔 / 模糊 / 每日上限 |
 | `talkQuietStart` / `talkQuietEnd` | 静默时段（留空 = 不设） |
+| `planningEnabled` / `planningHorizonMinutes` | 滚动生活规划开关（默认开启）/ 向前规划的时长（分钟，默认 180，范围 5–1440） |
 | `actionEnabled` / `actionIntervalMinutes` / `actionJitterMinutes` / `actionIdleMinutes` | 自由动作开关 / 间隔 / 模糊 / 静默多久才动 |
 | `actionDefaultMinutes` / `actionMinMinutes` / `actionMaxMinutes` / `actionDailyMax` | 动作时长默认 / 最短 / 最长 / 每日上限 |
 | `citySelf` / `cityUser` | 角色所在城市 / 用户所在城市（留空 = 同城） |
@@ -57,6 +58,12 @@ dsh plugin --profile <profile> add "git+https://github.com/2huy4n/ProjectKaren#v
 | `apiBase` / `apiPath` / `apiKey` / `model` / `size` | 生图接口（OpenAI 兼容的 /images/generations） |
 | `photoPrompt` | 没传 prompt 时用的默认画面描述 |
 | `offsetMinutes` | 时钟偏移（调试用，整体平移插件看到的"现在"） |
+
+`planningHorizonMinutes` 控制滚动规划每次向前考虑多长时间；
+`actionIntervalMinutes` 控制旧版空闲动作调度器两次请求之间的等待时间。
+会话开始使用滚动生活记录后，旧版的间隔、抖动、空闲阈值和每日动作上限不再决定该会话的活动。
+此时关闭 `planningEnabled` 会暂停生成新计划和开始已安排的活动，**不会恢复旧版调度器**；
+重新开启时，暂停期间错过的活动会被标记为延期。详见[滚动生活规划说明](docs/rolling-life-work-in-progress.md)。
 
 ## `/mute` 指令
 

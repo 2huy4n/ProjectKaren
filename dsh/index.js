@@ -30,9 +30,11 @@ import { weatherKey, isWet, fetchWeather } from './weather.mjs'
 import { holidaysOn, birthdayKind, lunarYearCovered, LUNAR_MIN_YEAR, LUNAR_MAX_YEAR } from './events.mjs'
 import { parseMuteInput } from './mute.mjs'
 import { SessionTimeline } from './session.mjs'
+import { LifePlanner, planningContext } from './life.mjs'
+import { generateLifePlan } from './planner.mjs'
 
 export const name = 'project-karen'
-export const inject = ['agents', 'tools', 'attachments']
+export const inject = ['agents', 'tools', 'attachments', 'llm']
 
 const ROUTE = '/project-karen'
 const TICK_MS = 20000
@@ -209,6 +211,16 @@ export function apply(ctx, config = {}) {
     log: (entry) => store.pushLog(entry),
   })
   const entries = new Map()
+  const planner = new LifePlanner({
+    now: () => Date.now() + store.offsetMs,
+    read: (id, at) => timeline.lifeSnapshot(id, store.config, at),
+    save: (id, result, context) => timeline.saveLifePlan(id, result, context),
+    generate: (input) => {
+      const agent = [...entries.keys()].find(a => sessionIdOf(a) === input.sessionId)
+      if (!agent) throw Error('Agent no longer attached')
+      return generateLifePlan(ctx.llm, agent, input)
+    },
+  })
   let stopping = false
 
   const now = () => Date.now() + store.offsetMs
@@ -397,6 +409,12 @@ export function apply(ctx, config = {}) {
     const cfg = store.config
     if (!cfg.enabled) return
     const at = now()
+    const canPlan = cfg.planningEnabled && cfg.actionEnabled && ctx.llm && typeof ctx.llm.stream === 'function'
+    if (canPlan || timeline.hasLife(sessionId)) timeline.advanceLife(sessionId, cfg, at)
+    if (canPlan) {
+      const events = typeof agent.session?.snapshotEvents === 'function' ? agent.session.snapshotEvents() : []
+      void planner.tick(sessionId, cfg, events).catch(error => logger.warn?.('project-karen: life planning deferred: ' + String(error?.message || error)))
+    }
     const plan = timeline.due(sessionId, cfg, at)
     for (const intent of plan.intents) {
       if (intent.kind === 'action') { deliverAction(sessionId, agent, at); continue }
@@ -501,6 +519,16 @@ export function apply(ctx, config = {}) {
             } catch { return '' }
           },
         })
+        const lifeInjection = ctx.llm ? contribute(agent, 'context', {
+          name: 'project-karen-life', order: 133,
+          text: () => {
+            if (!store.config.enabled || !timeline.hasLife(sessionId)) return ''
+            const view = timeline.lifeSnapshot(sessionId, store.config, now())
+            if (!view || view.skipped) return ''
+            const { current, ...context } = planningContext(view.life, now())
+            return 'FICTIONAL LIFE RECORD — plans are not completed events; conversation is not evidence of action.\n' + JSON.stringify(context)
+          },
+        }) : () => {}
         // 今天的情况：天气 + 节日 + 生日。三者都可开关，全空时不注入。
         // 频率比分钟低，但天气每小时会刷一次、节日跨天会变 —— 留在分节里照样让整条前缀
         // 每小时失效一次，所以同样是「会变的事实」，一样走上下文。
@@ -554,6 +582,7 @@ export function apply(ctx, config = {}) {
           try { actionInjection() } catch {}
           try { actionClockInjection() } catch {}
           try { todayInjection() } catch {}
+          try { lifeInjection() } catch {}
           try { cameraInjection() } catch {}
         }
       }, 'project-karen.runtime()')
@@ -886,7 +915,7 @@ export function apply(ctx, config = {}) {
       } else if (action === 'act-now') {
         if (timeline.forceAction(sessionId, cfg, at)) deliverAction(sessionId, agent, at)
       } else if (action === 'end-action') {
-        const finished = timeline.takeAction(sessionId)
+        const finished = timeline.takeAction(sessionId, at)
         if (!finished) continue
         deliverActionDone(sessionId, agent, { action: finished, silent: false })
       } else if (!timeline.debugApply(sessionId, at, action)) {
@@ -948,7 +977,14 @@ export function apply(ctx, config = {}) {
           // '' / undefined = 「不改」；'***xxxx' 是面板回显的脱敏值，同样不能当成新 Key 写回去，
           // 否则用户在面板里改任何别的设置再点保存，真实 Key 就会被这个掩码覆盖掉。
           if (incoming.apiKey === '' || incoming.apiKey === undefined || isMaskedApiKey(incoming.apiKey)) delete incoming.apiKey
+          const wasPlanningEnabled = store.config.planningEnabled
           const value = store.setConfig(incoming)
+          if (value.planningEnabled !== wasPlanningEnabled) {
+            const at = now()
+            for (const sessionId of Object.keys(store.state)) {
+              timeline.setPlanningPaused(sessionId, !value.planningEnabled, at)
+            }
+          }
           for (const [, item] of entries) timeline.snapshot(item.sessionId, store.config, now())
           refreshWeather(false) // 城市改了要立刻重取（内部会比对目标城市）
           sendJson(res, 200, { ok: true, value: { ...value, apiKey: maskApiKey(value.apiKey) } })

@@ -66,7 +66,7 @@ export function validateMessage(message) {
 // 与其让它悄悄污染，不如在第二次启动时当场炸掉。
 let live = null
 
-export async function startKaren({ config = {}, sessionId = 'sess-1', lang = 'zh', startAt, legacyPromptService = false, runtimeContextSuppressed = false, fetchStub } = {}) {
+export async function startKaren({ config = {}, sessionId = 'sess-1', lang = 'zh', startAt, legacyPromptService = false, runtimeContextSuppressed = false, fetchStub, llm } = {}) {
   if (live) {
     throw new Error('harness: 已有实例在运行（假时钟是进程级的）。请先 stop() 上一个再启动。')
   }
@@ -133,7 +133,7 @@ export async function startKaren({ config = {}, sessionId = 'sess-1', lang = 'zh
 
   const agent = {
     id: sessionId,
-    session: { id: sessionId },
+    session: { id: sessionId, snapshotEvents() { return [] }, requestHeader() { return { config: { provider: 'mock', model: 'mock' } } } },
     followup(message) {
       // 真实宿主会按会话格式校验 inbox；这里照着校验，否则「消息形状不合规」这类
       // 问题在测试里完全隐形 —— 正是它让 175 项断言全绿却漏掉了 V4 的 source 规则。
@@ -159,6 +159,7 @@ export async function startKaren({ config = {}, sessionId = 'sess-1', lang = 'zh
   const commandReg = { register(spec) { commands.set(spec.name, spec) } }
 
   const ctx = {
+    llm,
     logger: {
       info() {},
       warn(msg) { warnings.push(String(msg)) },
