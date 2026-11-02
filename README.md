@@ -28,7 +28,7 @@
 从 GitHub：
 
 ```powershell
-dsh plugin --profile <profile> add "git+https://github.com/2huy4n/ProjectKaren#v0.3.0"
+dsh plugin --profile <profile> add "git+https://github.com/2huy4n/ProjectKaren#v0.3.1"
 ```
 
 安装后需要重启 DSH，在「设置 → ProjectKaren」里配置。
