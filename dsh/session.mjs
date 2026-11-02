@@ -27,6 +27,8 @@
 // 与 talkCount），这正是 describe() 需要 `||` 兜底的根因。这里把易失的两个改成
 // actionRollCount / talkRollCount（它们只当抖动种子用），持久的沿用原名不动，
 // 因此磁盘上的键一个没变。客户端看到的字段名由 describe() 这个适配器负责。
+import { randomUUID } from 'node:crypto'
+import { lifeOf, migrateAction, addPlan, transition } from './life.mjs'
 import { ensureNight, phaseOf, hashUnit, dayKeyOf, noonAtMs, inQuiet } from './sleep.js'
 
 /** 易失字段及其初值。进程重启后应当回到这里给出的初值。 */
@@ -68,6 +70,7 @@ export class SessionTimeline {
     const stored = this.state[id]
     const record = stored && typeof stored === 'object' ? stored : (this.state[id] = {})
 
+    if (record.life) migrateAction(record)
     const volatile = {}
     for (const [key, seed] of Object.entries(VOLATILE)) {
       volatile[key] = seed()
@@ -87,6 +90,17 @@ export class SessionTimeline {
   /** 摇夜：睡醒了或配置改了才重摇；重摇就落盘。 */
   #ensureNight(record, sessionId, cfg, at) {
     const before = record.wakeAtMs
+    const priorSleep = record.sleepAtMs
+    if ((cfg.planningEnabled || record.life) && Number.isFinite(before) && Number.isFinite(priorSleep) && before <= at && (record.life || record.action)) {
+      const life = record.life || migrateAction(record)
+      let changed = false
+      for (const a of life.activities) {
+        if ((a.status === 'in_progress' && a.startedAt < before && !(record.awakeUntilMs >= before && a.startedAt >= record.stirredAtMs)) || (a.status === 'planned' && a.startAt < before && a.endAt > priorSleep)) {
+          transition(life, a.id, 'postponed', at, { reason: 'Offline across sleep' }); changed = true
+        }
+      }
+      if (changed) { life.needsReplan = true; life.revision = (life.revision || 0) + 1 }
+    }
     ensureNight(record, { nowMs: at, sessionId, cfg })
     if (before !== record.wakeAtMs) this.persist()
   }
@@ -166,7 +180,7 @@ export class SessionTimeline {
       lastWakeAtMs: num(record.lastWakeAtMs),
       stirCount: record.stirCount || 0,
       stirredAtMs: num(record.stirredAtMs),
-      action: record.action ? { ...record.action } : null,
+      action: record.life ? this.#currentAction(record) : (record.action ? { ...record.action } : null),
       actionDayCount: record.actionCount || 0,
       actionRollCount: record.actionRollCount || 0,
       lastActionAt: record.lastActionAt || 0,
@@ -178,6 +192,198 @@ export class SessionTimeline {
       actionsToday: this.#dayUsed(record, 'action', at),
       talksToday: this.#dayUsed(record, 'talk', at),
     }
+  }
+
+  #currentAction(record) {
+    const a = lifeOf(record).activities.find(x => x.status === 'in_progress')
+    return a ? { ...a, endsAt: a.endAt, startedAt: a.startedAt ?? a.startAt, minutes: Math.round((a.endAt - a.startAt) / 60000) } : null
+  }
+
+  hasLife(sessionId) {
+    return !!this.#of(sessionId)?.life
+  }
+
+  lifeSnapshot(sessionId, cfg, at) {
+    const record = this.#of(sessionId)
+    if (!record) return null
+    this.#ensureNight(record, sessionId, cfg, at)
+    if (!record.life) { migrateAction(record); this.persist() }
+    return { life: structuredClone(record.life), revision: record.life.revision || 0,
+      phase: phaseOf(record, at), skipped: !!record.skipped,
+      planningEnabled: cfg.planningEnabled, actionEnabled: cfg.actionEnabled, planningHorizonMinutes: cfg.planningHorizonMinutes,
+      sleepAtMs: record.sleepAtMs, awakeUntilMs: record.awakeUntilMs }
+  }
+
+  saveLifePlan(sessionId, result, { now, windowEnd, sleepAt, revision }) {
+    const record = this.#of(sessionId)
+    if (!record?.life || (record.life.revision || 0) !== revision) throw Error('stale plan')
+    const life = structuredClone(record.life)
+    const current = life.activities.find(a => a.status === 'in_progress')
+    if (current) {
+      if (!result?.resolution || result.resolution.id !== current.id || !['continue', 'interrupted', 'postponed', 'cancelled'].includes(result.resolution.status)) throw Error('current activity needs explicit resolution')
+      if (typeof result.resolution.reason !== 'string' || !result.resolution.reason.trim()) throw Error('activity resolution requires a reason')
+      if (result.resolution.status === 'continue') {
+        const end = Number(result.resolution.endAt)
+        if (!Number.isFinite(end) || end <= now || end > windowEnd || (Number.isFinite(sleepAt) && end > sleepAt)) throw Error('invalid continuation')
+        if (life.activities.some(a => a.id !== current.id && a.status === 'planned' && a.startAt < end && a.endAt > now)) throw Error('continuation conflicts with commitment')
+        current.endAt = end; current.updatedAt = now; current.reason = result.resolution.reason.slice(0, 240)
+      } else transition(life, current.id, result.resolution.status, now, result.resolution)
+    }
+    if (!Array.isArray(result?.activities) || result.activities.length > 12) throw Error('invalid plan')
+    if (result?.changes !== undefined && (!Array.isArray(result.changes) || result.changes.length > 12)) throw Error('invalid changes')
+    for (const change of result.changes || []) {
+      const target = life.activities.find(a => a.id === change.id)
+      if (!target || typeof change.reason !== 'string' || !change.reason.trim()) throw Error('invalid activity change')
+      if (target.status === 'postponed' && change.status === 'resume') {
+        const startAt = Number(change.startAt), endAt = Number(change.endAt)
+        if (!Number.isFinite(startAt) || !Number.isFinite(endAt) || startAt < now || startAt >= windowEnd || endAt <= startAt || endAt > windowEnd || (Number.isFinite(sleepAt) && endAt > sleepAt)) throw Error('invalid resumed activity interval')
+        if (life.activities.some(a => a.id !== target.id && ['planned', 'in_progress'].includes(a.status) && startAt < (a.status === 'in_progress' && a.endAt < now ? Infinity : a.endAt) && a.startAt < endAt)) throw Error('resumed activity conflict')
+        if (life.anchors.some(a => !['cancelled', 'completed'].includes(a.status) && startAt < a.endAt && a.startAt < endAt && target.label.trim().toLowerCase() !== a.label.trim().toLowerCase())) throw Error('resumed activity conflicts with anchor')
+        target.previousPostponement = { startAt: target.startAt, endAt: target.endAt, startedAt: target.startedAt, endedAt: target.endedAt, reason: target.reason }
+        target.startAt = startAt; target.endAt = endAt; target.status = 'planned'; target.updatedAt = now
+        target.resumeReason = change.reason.trim().slice(0, 240)
+        delete target.startedAt; delete target.endedAt; delete target.reason
+      } else {
+        const allowed = target.status === 'planned' ? ['cancelled', 'postponed', 'skipped'] : target.status === 'postponed' ? ['cancelled', 'skipped'] : []
+        if (!allowed.includes(change.status)) throw Error('invalid activity change')
+        if (target.status === 'postponed') target.previousPostponement = { startAt: target.startAt, endAt: target.endAt, startedAt: target.startedAt, endedAt: target.endedAt, reason: target.reason }
+        transition(life, target.id, change.status, now, { reason: change.reason })
+      }
+    }
+    if (result?.anchorChanges !== undefined && (!Array.isArray(result.anchorChanges) || result.anchorChanges.length > 6)) throw Error('invalid anchor changes')
+    for (const change of result.anchorChanges || []) {
+      const anchor = life.anchors.find(a => a.id === change.id)
+      if (!anchor || ['cancelled', 'completed'].includes(anchor.status) || change.status !== 'cancelled' || typeof change.reason !== 'string' || !change.reason.trim()) throw Error('invalid anchor change')
+      anchor.status = 'cancelled'; anchor.cancelledAt = now; anchor.reason = change.reason.trim().slice(0, 240)
+    }
+    // Keep established anchors; allow later plans to add new commitments.
+    if (Array.isArray(result.anchors)) {
+      for (const a of result.anchors.slice(0, 6)) {
+        const label = typeof a.label === 'string' ? a.label.trim().slice(0, 200) : ''
+        const startAt = Number(a.startAt), endAt = Number(a.endAt)
+        if (!label || !Number.isFinite(startAt) || !Number.isFinite(endAt) || endAt <= startAt) throw Error('invalid anchor')
+        const same = x => x.label.trim().toLowerCase() === label.toLowerCase()
+        if (life.anchors.some(x => !['cancelled', 'completed'].includes(x.status) && x.startAt === startAt && x.endAt === endAt && same(x))) continue
+        if (life.anchors.some(x => !['cancelled', 'completed'].includes(x.status) && x.startAt < endAt && startAt < x.endAt && same(x))) throw Error('anchor change requires explicit resolution')
+        if (life.anchors.some(x => !['cancelled', 'completed'].includes(x.status) && x.startAt < endAt && startAt < x.endAt && !same(x)) || life.activities.some(x => ['planned', 'in_progress'].includes(x.status) && x.startAt < endAt && startAt < x.endAt && !same(x))) throw Error('anchor conflicts with commitment')
+        life.anchors.push({ id: randomUUID(), label, startAt, endAt })
+      }
+    }
+    // Never discard unresolved commitments, including overdue appointments.
+    const finishedAnchors = life.anchors.filter(a => ['cancelled', 'completed'].includes(a.status))
+    const keptAnchors = new Set(finishedAnchors.slice(-100).map(a => a.id))
+    life.anchors = life.anchors.filter(a => !['cancelled', 'completed'].includes(a.status) || keptAnchors.has(a.id))
+    for (const a of result.activities) {
+      if (life.anchors.some(anchor => !['cancelled', 'completed'].includes(anchor.status) && a.startAt < anchor.endAt && anchor.startAt < a.endAt && String(a.label).trim().toLowerCase() !== anchor.label.toLowerCase())) throw Error('activity conflicts with anchor')
+      const recent = life.activities.filter(x => ['completed', 'interrupted', 'postponed'].includes(x.status)).slice(-5)
+      if (recent.some(x => x.label.toLowerCase() === String(a.label).trim().toLowerCase()) && !(typeof a.repeatReason === 'string' && a.repeatReason.trim())) throw Error('repeated activity requires a reason')
+    }
+    addPlan(life, result.activities, { now, windowEnd, sleepAt })
+    // Retain unfinished commitments and the most recent terminal history.
+    const terminal = life.activities.filter(a => ['completed', 'cancelled', 'skipped', 'interrupted'].includes(a.status))
+    const keep = new Set(terminal.slice(-200).map(a => a.id))
+    life.activities = life.activities.filter(a => !['completed', 'cancelled', 'skipped', 'interrupted'].includes(a.status) || keep.has(a.id))
+    life.needsReplan = false
+    life.revision = revision + 1
+    const previous = record.life
+    record.life = life
+    if (this.persist() === false) { record.life = previous; throw Error('could not persist plan') }
+  }
+
+  // Confirmation is a separate tool event, never a claim in a plan response.
+  completeAction(sessionId, activityId, label, consequences, callId, at, cfg) {
+    const record = this.#of(sessionId)
+    if (!record?.life || typeof callId !== 'string' || !callId) throw Error('activity confirmation requires an identified tool call')
+    this.#ensureNight(record, sessionId, cfg, at)
+    const previous = record.life
+    const life = structuredClone(previous)
+    const activity = life.activities.find(a => a.id === activityId)
+    if (!activity || activity.label !== label) throw Error('activity confirmation does not match the record')
+    if (activity.status === 'completed') return { ...activity, endsAt: activity.endAt }
+    if (phaseOf(record, at) !== 'awake') throw Error('cannot confirm an activity while asleep')
+    if (activity.status !== 'in_progress') throw Error('only an in-progress activity can be confirmed')
+    if (!Array.isArray(consequences) || consequences.length > 5 || consequences.some(x => typeof x !== 'string' || !x.trim() || x.length > 240)) throw Error('invalid consequences')
+    transition(life, activityId, 'completed', at, { consequences, reason: 'Explicit activity confirmation',
+      confirmation: { kind: 'karen_action', activityId, callId } })
+    for (const anchor of life.anchors) {
+      if (!['cancelled', 'completed'].includes(anchor.status) && anchor.label.trim().toLowerCase() === activity.label.trim().toLowerCase() && activity.startAt < anchor.endAt && anchor.startAt < activity.endAt) {
+        anchor.status = 'completed'; anchor.completedAt = at; anchor.activityId = activityId
+      }
+    }
+    life.needsReplan = true
+    life.revision = (life.revision || 0) + 1
+    record.life = life
+    if (this.persist() === false) { record.life = previous; throw Error('could not persist activity confirmation') }
+    return { ...life.activities.find(a => a.id === activityId), endsAt: activity.endAt }
+  }
+
+  // The switch pauses the rolling scheduler, not the fictional sleep clock.
+  // Persist the transition so a restart and fast off/on toggles cannot revive
+  // an in-flight response or silently start activities missed during the pause.
+  setPlanningPaused(sessionId, paused, at) {
+    const record = this.#of(sessionId)
+    if (!record?.life) return false
+    const life = record.life
+    const wasPaused = life.planningPaused === true
+    if (wasPaused === paused) return false
+    life.planningPaused = paused
+    if (paused) life.planningPausedAt = at
+    else {
+      life.planningResumedAt = at
+      life.needsReplan = true
+      for (const activity of life.activities) {
+        if (activity.status === 'planned' && activity.startAt < at) {
+          transition(life, activity.id, 'postponed', at, { reason: 'Missed while planning was paused' })
+        }
+      }
+    }
+    life.revision = (life.revision || 0) + 1
+    this.persist()
+    return true
+  }
+
+  recoverOverdueLife(sessionId, at) {
+    const record = this.#of(sessionId)
+    if (!record || record.skipped || !record.life) return false
+    const life = record.life
+    const activity = life.activities.find(a => a.status === 'in_progress' && Number.isFinite(a.endAt) && a.endAt <= at)
+    if (!activity) return false
+    transition(life, activity.id, 'postponed', at, { reason: 'Unconfirmed after scheduler restart' })
+    life.needsReplan = true
+    life.revision = (life.revision || 0) + 1
+    this.persist()
+    return true
+  }
+
+  advanceLife(sessionId, cfg, at) {
+    const record = this.#of(sessionId)
+    if (!record || record.skipped) return
+    this.#ensureNight(record, sessionId, cfg, at)
+    const life = record.life || migrateAction(record)
+    this.setPlanningPaused(sessionId, cfg.planningEnabled === false, at)
+    let changed = false
+    const phase = phaseOf(record, at)
+    if (phase === 'asleep') {
+      for (const a of life.activities) {
+        if (a.status === 'in_progress' || (a.status === 'planned' && a.startAt < record.wakeAtMs)) {
+          transition(life, a.id, 'postponed', at, { reason: 'Sleep' }); changed = true
+        }
+      }
+      if (life.lastPhase !== phase) { life.needsReplan = true; changed = true }
+    } else {
+      if (life.lastPhase === 'asleep') { life.needsReplan = true; changed = true }
+      const busy = life.activities.some(a => a.status === 'in_progress')
+      if (!busy && !life.planningPaused) for (const a of life.activities) {
+        if (a.status !== 'planned' || a.startAt > at) continue
+        if (a.endAt <= at || (Number.isFinite(record.sleepAtMs) && record.sleepAtMs > at && a.endAt > record.sleepAtMs)) {
+          transition(life, a.id, 'postponed', at, { reason: 'Missed or overlaps sleep' }); life.needsReplan = true
+        } else transition(life, a.id, 'in_progress', at)
+        changed = true
+        break
+      }
+    }
+    if (life.lastPhase !== phase) { life.lastPhase = phase; changed = true }
+    if (changed) { life.revision = (life.revision || 0) + 1; this.persist() }
   }
 
   // ── 状态迁移 ──────────────────────────────────────────────────────
@@ -208,9 +414,20 @@ export class SessionTimeline {
   }
 
   /** 取出并清空当前动作（不投递）。没有动作时返回 null。 */
-  takeAction(sessionId) {
+  takeAction(sessionId, at) {
+    if (!Number.isFinite(at)) throw Error('activity time is required')
     const record = this.#of(sessionId)
-    if (!record || !record.action) return null
+    if (!record) return null
+    if (record.life) {
+      const current = this.#currentAction(record)
+      if (!current) return null
+      transition(record.life, current.id, 'interrupted', at, { reason: 'Ended by debug control' })
+      record.life.needsReplan = true
+      record.life.revision = (record.life.revision || 0) + 1
+      this.persist()
+      return current
+    }
+    if (!record.action) return null
     const finished = { ...record.action }
     record.action = null
     this.persist()
@@ -247,9 +464,23 @@ export class SessionTimeline {
   }
 
   /** 某个工具/指令直接开一个动作（karen_action）。 */
-  startAction(sessionId, action, at) {
+  startAction(sessionId, action, at, cfg) {
     const record = this.#of(sessionId)
     if (!record) return null
+    if (cfg) this.#ensureNight(record, sessionId, cfg, at)
+    if (record.life) {
+      const life = record.life
+      if (phaseOf(record, at) !== 'awake') throw Error('cannot start an activity while asleep')
+      if (life.activities.some(a => a.status === 'in_progress')) throw Error('an activity is already in progress')
+      const endAt = at + action.minutes * 60000
+      const boundary = record.awakeUntilMs > at && record.sleepAtMs <= at ? record.awakeUntilMs : record.sleepAtMs
+      if (boundary > at && endAt > boundary) throw Error('activity overlaps sleep')
+      const [item] = addPlan(life, [{ label: action.label, motive: action.motive, startAt: at, endAt }], { now: at, windowEnd: endAt })
+      transition(life, item.id, 'in_progress', at)
+      life.revision = (life.revision || 0) + 1
+      this.persist()
+      return { ...item, endsAt: item.endAt }
+    }
     const stored = {
       label: action.label,
       motive: action.motive || '',
@@ -399,7 +630,7 @@ export class SessionTimeline {
     }
 
     // 3. 结算到点的动作（先于搭话：清空 action 会改变搭话的提示词）
-    if (record.action && at >= record.action.endsAt) {
+    if (!record.life && record.action && at >= record.action.endsAt) {
       const finished = { ...record.action }
       record.action = null
       this.persist()
@@ -425,7 +656,7 @@ export class SessionTimeline {
           intents.push({
             kind: 'talk',
             silentMinutes: Math.max(1, Math.round((at - (record.lastUserAt || at)) / 60000)),
-            action: record.action ? { ...record.action } : null,
+            action: record.life ? this.#currentAction(record) : (record.action ? { ...record.action } : null),
             at,
           })
         }
@@ -433,7 +664,7 @@ export class SessionTimeline {
     }
 
     // 5. 自由动作
-    if (!record.skipped && cfg.actionEnabled) {
+    if (!record.life && !record.skipped && cfg.actionEnabled) {
       if (muted) {
         // 静默期：不开始新动作，也不消耗每日额度
         record.nextActionAt = at + 5 * 60000
