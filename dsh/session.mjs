@@ -257,7 +257,6 @@ export class SessionTimeline {
       anchor.status = 'cancelled'; anchor.cancelledAt = now; anchor.reason = change.reason.trim().slice(0, 240)
     }
     // Keep established anchors; allow later plans to add new commitments.
-    const today = dayKeyOf(now)
     if (Array.isArray(result.anchors)) {
       for (const a of result.anchors.slice(0, 6)) {
         const label = typeof a.label === 'string' ? a.label.trim().slice(0, 200) : ''
@@ -269,7 +268,6 @@ export class SessionTimeline {
         if (life.anchors.some(x => !['cancelled', 'completed'].includes(x.status) && x.startAt < endAt && startAt < x.endAt && !same(x)) || life.activities.some(x => ['planned', 'in_progress'].includes(x.status) && x.startAt < endAt && startAt < x.endAt && !same(x))) throw Error('anchor conflicts with commitment')
         life.anchors.push({ id: randomUUID(), label, startAt, endAt })
       }
-      life.anchorDay = today
     }
     // Never discard unresolved commitments, including overdue appointments.
     const finishedAnchors = life.anchors.filter(a => ['cancelled', 'completed'].includes(a.status))
