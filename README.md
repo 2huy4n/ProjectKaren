@@ -20,7 +20,7 @@
 - **静默指令**：`/mute 30` —— 你让TA闭嘴一段时间，TA就不再主动开口（你说话TA照常回）
 - **天气**：填了城市，TA会知道外面什么天，问候和闲聊里会自然带上
 - **节日**：节日当天有不一样的问候、话题与行动
-- **生日**：支持填写你和TA的生日，
+- **生日**：支持填写你和TA的生日
 - **中英双语**：面板文案跟随 DSH 界面语言；注入给模型的提示词也跟随
 
 ## 安装
@@ -28,7 +28,7 @@
 从 GitHub：
 
 ```powershell
-dsh plugin --profile <profile> add "git+https://github.com/2huy4n/ProjectKaren#v0.2.4"
+dsh plugin --profile <profile> add "git+https://github.com/2huy4n/ProjectKaren#v0.3.0"
 ```
 
 安装后需要重启 DSH，在「设置 → ProjectKaren」里配置。
